@@ -15,6 +15,7 @@
 #   elan-fp score      measure actual NCC match scores (elanpress only)
 #   elan-fp impostor   measure WRONG-finger scores — decides if tuning is safe
 #   elan-fp unwedge    run the recovery ladder on its own
+#   elan-fp collect L  capture a labelled dataset for offline matcher work
 #   elan-fp doctor     full diagnostic dump for bug reports
 #
 # Flags:  --debug    keep driver logs (implies manual fprintd, needs root)
@@ -569,6 +570,78 @@ do_status() {
   fi
 }
 
+
+# Collect a labelled dataset for offline matcher development. Requires a driver
+# built with ELANPRESS_DUMP_DIR support. Any enrolled print will do -- we only
+# want the captures, not the verdicts.
+DATASET="${XDG_DATA_HOME:-$HOME/.local/share}/elan-fp/dataset"
+do_collect() {
+  local label="${1:-}"
+  if [[ -z $label ]]; then
+    bad "usage: elan-fp collect <label>   (e.g. 'right-index', 'left-thumb')"
+    return 1
+  fi
+  if [[ -z $(enrolled_fingers) ]]; then
+    bad "verify is used to trigger captures, so something must be enrolled first"
+    note "run: elan-fp enroll"
+    return 3
+  fi
+
+  need_root
+  local out="$DATASET/$label" raw
+  raw=$(mktemp -d)
+  mkdir -p "$out"
+
+  say "Collecting $ITERATIONS captures labelled '${B}${label}${N}'."
+  say "Press the SAME finger each time, but vary placement slightly —"
+  say "a dataset of identical presses will overstate how good any matcher is."
+  say
+
+  kill_fprintd
+  as_root sh -c "LC_ALL=C G_MESSAGES_DEBUG=all ELANPRESS_DUMP_DIR='$raw' /usr/lib/fprintd -t > '$LOGDIR/collect.log' 2>&1 &"
+  sleep 2
+  trap 'stop_debug_daemon' EXIT
+
+  local i
+  for ((i = 1; i <= ITERATIONS; i++)); do
+    printf '  %2d/%d ... ' "$i" "$ITERATIONS"
+    run_fprintd "$VERIFY_TIMEOUT" "$LOGDIR/collect-$i.log" fprintd-verify "$FPUSER" >/dev/null
+    printf 'captured\n'
+  done
+
+  as_root pkill -x fprintd 2>/dev/null
+  trap - EXIT
+  sleep 1
+
+  as_root chown -R "$(id -u):$(id -g)" "$raw" 2>/dev/null
+  local n=0
+  local f
+  for f in "$raw"/press_*.pgm; do
+    [[ -e $f ]] || continue
+    mv "$f" "$out/$(date +%s)-$(basename "$f")"
+    n=$((n + 1))
+  done
+  rm -rf "$raw"
+
+  say
+  if (( n == 0 )); then
+    bad "no captures written — is the driver built with ELANPRESS_DUMP_DIR support?"
+    note "check: strings -a /usr/lib/libfprint-2.so.2.0.0 | grep ELANPRESS_DUMP_DIR"
+    return 1
+  fi
+  ok "$n captures saved to $out"
+  say
+  say "  dataset so far:"
+  local d
+  for d in "$DATASET"/*/; do
+    [[ -d $d ]] || continue
+    printf '    %-20s %d captures\n' "$(basename "$d")" "$(find "$d" -name '*.pgm' | wc -l)"
+  done
+  say
+  note "Collect at least two labels (two different fingers) so impostor pairs exist."
+  return 0
+}
+
 do_doctor() {
   mkdir -p "$LOGDIR"
   local out
@@ -610,10 +683,11 @@ usage() {
   exit "${1:-0}"
 }
 
-CMD=""
+CMD=""; LABEL=""
 while (( $# )); do
   case $1 in
     status|verify|enroll|test|score|impostor|unwedge|doctor) CMD=$1 ;;
+    collect) CMD=collect; shift; LABEL="${1:-}" ;;
     --debug) DEBUG=1 ;;
     -n) shift; ITERATIONS=${1:-10} ;;
     -h|--help) usage 0 ;;
@@ -638,5 +712,6 @@ case $CMD in
   score)   do_score ;;
   impostor) do_impostor ;;
   unwedge) need_root; unwedge 3 ;;
+  collect) need_root; do_collect "$LABEL" ;;
   doctor)  do_doctor ;;
 esac
