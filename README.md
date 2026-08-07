@@ -16,6 +16,43 @@ the next person does not repeat the same dead ends.
 
 ---
 
+## Quick start: `elan-fp`
+
+[`tools/elan-fp`](tools/elan-fp) drives the sensor and recovers it automatically.
+It exists because this device fails in several unrelated ways, and one of them
+(an unbounded poll loop in the `elanpress` driver) **hangs forever instead of
+erroring**. Every operation here is timeout-bounded, and failures escalate
+through a recovery ladder rather than blocking or giving up.
+
+```sh
+install -Dm755 tools/elan-fp ~/.local/bin/elan-fp
+
+elan-fp status     # sensor, driver, power policy, enrollment, PAM state
+elan-fp enroll     # unwedges first, so a bad activation isn't wasted
+elan-fp test       # 10 verifications, reports a match rate
+elan-fp doctor     # full diagnostic dump, safe to attach to a bug report
+```
+
+The recovery ladder, applied automatically between retries:
+
+| Level | Action | Clears |
+|---|---|---|
+| 1 | stop `fprintd`, kill strays | stale device claims |
+| 2 | USB **selective suspend** + resume | some firmware state — clocks actually stop |
+| 3 | `authorized` 0→1 | kernel-side enumeration state only |
+
+Level 2 is the interesting one: it's the closest thing to a power cycle you can
+trigger from software. **A common udev rule pinning `power/control=on` (to stop
+autosuspend killing the sensor mid-use) disables it** — `elan-fp` temporarily
+overrides that and restores your setting afterwards. `elan-fp status` warns when
+that rule is blocking recovery.
+
+Note that `authorized` toggling and `g_usb_device_reset()` are **logical**
+operations: VBUS is never interrupted and the sensor's MCU keeps running through
+both. On units exhibiting the once-per-power-up wedge, neither is sufficient.
+
+---
+
 ## The hardware
 
 | | |

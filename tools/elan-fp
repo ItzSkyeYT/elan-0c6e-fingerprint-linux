@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+#
+# elan-fp — drive and recover an ELAN 04f3:0c6e fingerprint sensor.
+#
+# This sensor has several independent failure modes that each need a different
+# recovery, and one of them (an infinite poll loop in the elanpress driver)
+# hangs forever rather than erroring. Every operation here is therefore
+# timeout-bounded, and failures escalate through a recovery ladder instead of
+# giving up or blocking.
+#
+#   elan-fp status     what the sensor/driver/enrollment currently look like
+#   elan-fp verify     verify, auto-recovering and retrying on failure
+#   elan-fp enroll     enroll, unwedging first so the attempt isn't wasted
+#   elan-fp test       verify 10x and report a match rate
+#   elan-fp unwedge    run the recovery ladder on its own
+#   elan-fp doctor     full diagnostic dump for bug reports
+#
+# Flags:  --debug    keep driver logs (implies manual fprintd, needs root)
+#         -n N       iterations for `test` (default 10)
+#
+# https://github.com/ItzSkyeYT/elan-0c6e-fingerprint-linux
+
+set -uo pipefail
+
+VID=04f3
+PID=0c6e
+FPUSER="${SUDO_USER:-$USER}"
+LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/elan-fp"
+VERIFY_TIMEOUT=40      # generous: user must physically touch the sensor
+ENROLL_TIMEOUT=180     # enrollment needs several touches
+SETTLE=2               # seconds to let the device re-enumerate
+
+DEBUG=0; ITERATIONS=10
+
+if [[ -t 1 ]]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; DIM=$'\e[2m'; N=$'\e[0m'
+else
+  R=; G=; Y=; B=; DIM=; N=
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s  ✔%s %s\n' "$G" "$N" "$*"; }
+bad()  { printf '%s  ✘%s %s\n' "$R" "$N" "$*"; }
+warn() { printf '%s  !%s %s\n' "$Y" "$N" "$*"; }
+step() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+note() { printf '%s    %s%s\n' "$DIM" "$*" "$N"; }
+
+need_root() {
+  if [[ $EUID -ne 0 ]]; then
+    sudo -v || { bad "sudo required"; exit 1; }
+  fi
+}
+as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+
+# ---------------------------------------------------------------- device ----
+
+# Re-resolved after every recovery step: re-enumeration can change the path.
+find_device() {
+  local d v p
+  for d in /sys/bus/usb/devices/*/; do
+    [[ -f "$d/idVendor" && -f "$d/idProduct" ]] || continue
+    v=$(<"$d/idVendor"); p=$(<"$d/idProduct")
+    if [[ $v == "$VID" && $p == "$PID" ]]; then
+      printf '%s' "${d%/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+device_present() { find_device >/dev/null 2>&1; }
+
+current_driver() {
+  # Most authoritative: ask the running driver what it calls itself.
+  # elan  -> "ElanTech Fingerprint Sensor"
+  # press -> "ElanTech press-type fingerprint sensor (press)"
+  local name
+  name=$(timeout 10 fprintd-list "$FPUSER" 2>/dev/null | sed -n 's/.* on \(.*\):$/\1/p' | head -1)
+  if [[ -n $name ]]; then
+    case ${name,,} in
+      *press*) printf 'elanpress'; return ;;
+      *elan*)  printf 'elan';      return ;;
+    esac
+  fi
+
+  # Fallback when nothing is enrolled: inspect the library.
+  # NOTE: -a is required. Plain `strings` only scans loadable initialised
+  # sections and misses the GObject type name entirely.
+  local so=/usr/lib/libfprint-2.so.2
+  if [[ -r $so ]] && strings -a "$so" 2>/dev/null | grep -q FpiDeviceElanPress; then
+    printf 'elanpress'
+  elif [[ -r $so ]]; then
+    printf 'elan'
+  else
+    printf 'unknown'
+  fi
+}
+
+enrolled_fingers() {
+  timeout 15 fprintd-list "$FPUSER" 2>/dev/null \
+    | sed -n 's/^ - #[0-9]*: //p'
+}
+
+# -------------------------------------------------------------- recovery ----
+
+kill_fprintd() {
+  as_root systemctl stop fprintd 2>/dev/null
+  as_root pkill -x fprintd 2>/dev/null
+  sleep 1
+  return 0
+}
+
+# Level 2: USB selective suspend. Closest thing to a power cycle reachable
+# from software — clocks stop, and the MCU may reinitialise on resume.
+# NOTE: a udev rule pinning power/control=on will defeat this; we override
+# it for the duration and restore afterwards.
+usb_suspend_cycle() {
+  local dev; dev=$(find_device) || return 1
+  local prev_ctl prev_delay
+  prev_ctl=$(cat "$dev/power/control" 2>/dev/null || echo on)
+  prev_delay=$(cat "$dev/power/autosuspend_delay_ms" 2>/dev/null || echo -1000)
+
+  as_root sh -c "echo auto > '$dev/power/control'" 2>/dev/null
+  as_root sh -c "echo 500  > '$dev/power/autosuspend_delay_ms'" 2>/dev/null
+
+  local waited=0 status=
+  while (( waited < 6 )); do
+    sleep 1; waited=$((waited + 1))
+    status=$(cat "$dev/power/runtime_status" 2>/dev/null)
+    [[ $status == suspended ]] && break
+  done
+
+  # Restore the caller's policy before returning, whatever happened.
+  as_root sh -c "echo '$prev_ctl'   > '$dev/power/control'" 2>/dev/null
+  as_root sh -c "echo '$prev_delay' > '$dev/power/autosuspend_delay_ms'" 2>/dev/null
+  sleep "$SETTLE"
+
+  [[ $status == suspended ]]
+}
+
+# Level 3: deauthorize/reauthorize — forces full re-enumeration. Logical only,
+# VBUS is untouched, so this clears kernel-side state but not firmware state.
+usb_reauthorize() {
+  local dev; dev=$(find_device) || return 1
+  as_root sh -c "echo 0 > '$dev/authorized'" 2>/dev/null || return 1
+  sleep 1
+  as_root sh -c "echo 1 > '$dev/authorized'" 2>/dev/null || return 1
+  sleep "$SETTLE"
+  device_present
+}
+
+# Escalating ladder. $1 = level to reach (1-3).
+unwedge() {
+  local level="${1:-3}"
+
+  step "Recovery level 1: clearing fprintd state"
+  kill_fprintd
+  ok "fprintd stopped, stale claims released"
+  (( level < 2 )) && return 0
+
+  step "Recovery level 2: USB selective suspend/resume"
+  if usb_suspend_cycle; then
+    ok "device entered suspend and resumed"
+  else
+    warn "device would not enter suspend (a udev rule or active claim may block it)"
+  fi
+  (( level < 3 )) && return 0
+
+  step "Recovery level 3: USB re-enumeration"
+  if usb_reauthorize; then
+    ok "device re-enumerated"
+  else
+    bad "re-enumeration failed — device may have vanished from the bus"
+    return 1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------ operations ----
+
+# Runs a fprintd command under timeout, classifying the outcome.
+# Echoes one of: match | no-match | hang | error | no-prints
+# Full output goes to the file named by $2.
+run_fprintd() {
+  local cmd_timeout="$1" outfile="$2"; shift 2
+  local rc=0
+  timeout "$cmd_timeout" "$@" >"$outfile" 2>&1 || rc=$?
+
+  if (( rc == 124 )); then printf 'hang'; return; fi
+  if grep -q "verify-match" "$outfile" 2>/dev/null; then printf 'match'; return; fi
+  if grep -q "enroll-completed" "$outfile" 2>/dev/null; then printf 'match'; return; fi
+  if grep -q "verify-no-match" "$outfile" 2>/dev/null; then printf 'no-match'; return; fi
+  if grep -qi "NoEnrolledPrints\|no.*enrolled" "$outfile" 2>/dev/null; then printf 'no-prints'; return; fi
+  printf 'error'
+}
+
+do_verify() {
+  local attempt=0 result outfile
+  mkdir -p "$LOGDIR"
+
+  while (( attempt < 4 )); do
+    attempt=$((attempt + 1))
+    outfile="$LOGDIR/verify-$attempt.log"
+
+    step "Verify attempt $attempt/4 — touch the sensor when prompted"
+    result=$(run_fprintd "$VERIFY_TIMEOUT" "$outfile" fprintd-verify "$FPUSER")
+
+    case $result in
+      match)
+        ok "MATCH — the sensor is working"
+        return 0 ;;
+      no-match)
+        warn "no match (a real comparison ran, the score was too low)"
+        note "this is a matcher/threshold problem, not a wedged device"
+        return 2 ;;
+      no-prints)
+        bad "no enrolled prints for '$FPUSER' — run: elan-fp enroll"
+        return 3 ;;
+      hang)
+        warn "timed out after ${VERIFY_TIMEOUT}s with no result — device is wedged"
+        ;;
+      error)
+        warn "failed: $(grep -oiE 'error[^,]*|proto[^,]*' "$outfile" | head -1)"
+        ;;
+    esac
+
+    if (( DEBUG )) && [[ $result != match ]]; then
+      note "--- $outfile ---"
+      sed 's/^/      /' "$outfile" | tail -20
+    fi
+
+    case $result in
+      match|no-match|no-prints) : ;;
+    esac
+
+    if (( attempt < 4 )); then
+      say
+      unwedge "$attempt" || break
+      say
+    fi
+  done
+
+  bad "still failing after $attempt attempts and the full recovery ladder"
+  say
+  warn "This sensor is known to survive only ONE activation per power-up on"
+  warn "some units, and no software-reachable reset clears that state."
+  note "Next, in increasing cost:"
+  note "  systemctl suspend     # S3 may drop VBUS to internal ports"
+  note "  full poweroff         # not a reboot — power must actually drop"
+  note "Logs: $LOGDIR"
+  return 1
+}
+
+do_enroll() {
+  mkdir -p "$LOGDIR"
+  # Unwedge FIRST: on affected units the one good activation per power-up is a
+  # scarce resource, and spending it on a doomed attempt wastes the boot.
+  step "Preparing the device before enrolling"
+  unwedge 2
+  say
+
+  local outfile="$LOGDIR/enroll.log"
+  step "Enrolling — press and hold, lift, repeat as prompted"
+  local result
+  result=$(run_fprintd "$ENROLL_TIMEOUT" "$outfile" fprintd-enroll "$FPUSER")
+
+  case $result in
+    match) ok "enrollment completed"; say; note "now run: elan-fp test"; return 0 ;;
+    hang)  bad "enrollment hung — device wedged"; return 1 ;;
+    *)     bad "enrollment failed"; sed -n '1,20p' "$outfile"; return 1 ;;
+  esac
+}
+
+do_test() {
+  local pass=0 fail=0 hang=0 i result outfile
+  mkdir -p "$LOGDIR"
+
+  if [[ -z $(enrolled_fingers) ]]; then
+    bad "no enrolled prints — run: elan-fp enroll"
+    return 3
+  fi
+
+  say "Running $ITERATIONS verifications. Touch the sensor at each prompt."
+  say "This is the only meaningful gate: enrollment succeeding proves nothing."
+  say
+  for ((i = 1; i <= ITERATIONS; i++)); do
+    outfile="$LOGDIR/test-$i.log"
+    printf '  %2d/%d ... ' "$i" "$ITERATIONS"
+    result=$(run_fprintd "$VERIFY_TIMEOUT" "$outfile" fprintd-verify "$FPUSER")
+    case $result in
+      match)    printf '%smatch%s\n'    "$G" "$N"; pass=$((pass + 1)) ;;
+      no-match) printf '%sno-match%s\n' "$Y" "$N"; fail=$((fail + 1)) ;;
+      hang)     printf '%shang%s\n'     "$R" "$N"; hang=$((hang + 1)) ;;
+      *)        printf '%serror%s\n'    "$R" "$N"; fail=$((fail + 1)) ;;
+    esac
+    (( hang >= 2 )) && { say; warn "two hangs — device wedged, stopping early"; break; }
+  done
+
+  say
+  say "  ${G}match${N} $pass   ${Y}no-match${N} $fail   ${R}hang${N} $hang   of $ITERATIONS"
+  say
+  if (( pass == ITERATIONS )); then
+    ok "$pass/$ITERATIONS — this is the bar for wiring PAM."
+    note "On KDE, /usr/lib/pam.d/kde-fingerprint already loads pam_fprintd,"
+    note "so the lock screen should work with no PAM edits at all."
+    note "Do NOT edit /etc/pam.d/system-auth or /etc/pam.d/sudo."
+  elif (( pass > 0 )); then
+    warn "intermittent — not safe for PAM. Every failed auth costs a delay."
+  else
+    bad "no matches"
+  fi
+  return 0
+}
+
+do_status() {
+  local dev driver fingers
+  if dev=$(find_device); then
+    ok "sensor present: $VID:$PID at ${dev##*/}"
+    note "runtime_status = $(cat "$dev/power/runtime_status" 2>/dev/null)"
+    note "power/control  = $(cat "$dev/power/control" 2>/dev/null)"
+    local delay; delay=$(cat "$dev/power/autosuspend_delay_ms" 2>/dev/null)
+    if [[ $delay == -* ]]; then
+      note "autosuspend    = disabled ($delay) — blocks level-2 recovery"
+    else
+      note "autosuspend    = ${delay}ms"
+    fi
+  else
+    bad "sensor $VID:$PID not found on the USB bus"
+    return 1
+  fi
+
+  driver=$(current_driver)
+  case $driver in
+    elanpress) ok "driver: elanpress (cross-correlation matching)" ;;
+    elan)      warn "driver: elan (NBIS minutiae — known not to verify on this sensor)" ;;
+    *)         warn "driver: could not determine" ;;
+  esac
+
+  if pgrep -x fprintd >/dev/null; then
+    note "fprintd is running (pid $(pgrep -x fprintd | tr '\n' ' '))"
+  fi
+
+  fingers=$(enrolled_fingers)
+  if [[ -n $fingers ]]; then
+    ok "enrolled: $(printf '%s' "$fingers" | tr '\n' ' ')"
+  else
+    warn "no enrolled prints for '$FPUSER'"
+  fi
+
+  if grep -rqs fprintd /etc/pam.d/; then
+    warn "pam_fprintd is referenced in /etc/pam.d — verify it before trusting sudo"
+    grep -rns fprintd /etc/pam.d/ | sed 's/^/      /'
+  else
+    note "no pam_fprintd in /etc/pam.d (KDE's vendor file is separate and safe)"
+  fi
+}
+
+do_doctor() {
+  mkdir -p "$LOGDIR"
+  local out
+  out="$LOGDIR/doctor-$(date +%Y%m%d-%H%M%S).txt"
+  {
+    echo "=== elan-fp doctor ==="
+    date
+    echo; echo "--- machine ---"
+    cat /sys/devices/virtual/dmi/id/sys_vendor /sys/devices/virtual/dmi/id/product_name 2>/dev/null
+    uname -r
+    echo; echo "--- libfprint ---"
+    pacman -Q libfprint libfprint-elanpress libfprint-elan0c6e fprintd 2>/dev/null
+    pacman -Qo /usr/lib/libfprint-2.so.2 2>/dev/null
+    echo "driver: $(current_driver)"
+    echo; echo "--- usb ---"
+    lsusb -d "$VID:$PID" 2>/dev/null
+    lsusb -v -d "$VID:$PID" 2>/dev/null | grep -E "bcdDevice|bNumEndpoints|bEndpointAddress|MaxPower"
+    echo; echo "--- power ---"
+    local dev; dev=$(find_device) && for f in control autosuspend_delay_ms runtime_status persist; do
+      echo "$f = $(cat "$dev/power/$f" 2>/dev/null)"
+    done
+    echo; echo "--- enrollment ---"
+    timeout 15 fprintd-list "$FPUSER" 2>&1
+    echo; echo "--- pam ---"
+    grep -rns fprintd /etc/pam.d/ 2>/dev/null || echo "(none in /etc/pam.d)"
+    for f in /usr/lib/pam.d/*fingerprint*; do [[ -e $f ]] && echo "${f##*/}"; done
+    echo; echo "--- udev ---"
+    cat /etc/udev/rules.d/*elan* /etc/udev/rules.d/*fingerprint* 2>/dev/null
+  } | tee "$out"
+  say
+  ok "written to $out"
+  note "Safe to attach to a bug report — contains no biometric data."
+}
+
+# ------------------------------------------------------------------ main ----
+
+usage() {
+  sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+CMD=""
+while (( $# )); do
+  case $1 in
+    status|verify|enroll|test|unwedge|doctor) CMD=$1 ;;
+    --debug) DEBUG=1 ;;
+    -n) shift; ITERATIONS=${1:-10} ;;
+    -h|--help) usage 0 ;;
+    *) bad "unknown argument: $1"; usage 1 ;;
+  esac
+  shift
+done
+[[ -z $CMD ]] && usage 0
+
+if ! command -v fprintd-verify >/dev/null; then
+  bad "fprintd is not installed"; exit 1
+fi
+if ! device_present; then
+  bad "no $VID:$PID sensor on this machine"; exit 1
+fi
+
+case $CMD in
+  status)  do_status ;;
+  verify)  need_root; do_verify ;;
+  enroll)  need_root; do_enroll ;;
+  test)    do_test ;;
+  unwedge) need_root; unwedge 3 ;;
+  doctor)  do_doctor ;;
+esac
