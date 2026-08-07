@@ -291,7 +291,13 @@ If you have `04f3:0c6e`, please open a PR adding a row.
 |---|---|---|---|---|---|
 | ASUS ROG Flow X13 GV301QH | `0x0161` | stock `elan` 1.94.100 | ✗ | — | proto error in capture |
 | ASUS ROG Flow X13 GV301QH | `0x0161` | patched `elan` (press averaging) | ✓ | 0/5 | captures show real ridges; never matches |
-| ASUS ROG Flow X13 GV301QH | `0x0161` | `elanpress` | *pending* | *pending* | |
+| ASUS ROG Flow X13 GV301QH | `0x0161` | `elanpress` (template from wedged device) | ✓ 8 stages | 4/9 | mean NCC 0.581, sd 0.159 |
+| **ASUS ROG Flow X13 GV301QH** | **`0x0161`** | **`elanpress` (template from healthy device)** | **✓** | **8/10** | **stock 0.55 threshold, no hangs** |
+
+**The single biggest factor is enrolling on a non-wedged device.** The same
+driver and threshold went from 4/9 to 8/10 purely by re-enrolling after a
+successful USB selective-suspend recovery. If your match rate is poor, re-enroll
+before touching anything else — `elan-fp enroll` unwedges first for this reason.
 
 ---
 
