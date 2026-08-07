@@ -320,11 +320,27 @@ pixels. Maximising over that many trials inflates the score for any pair of
 textured images, which is exactly the observed symptom (and also why a single
 verification takes seconds).
 
+**Tightening the search window does not help — tested and refuted.** The
+hypothesis was that maximising over ~35,000 weakly-overlapping alignments
+inflated impostor scores. Narrowing to ±15px / ±6px / ±4° (1,209 alignments) and
+raising the minimum overlap from 19% to 64% of the frame gave:
+
+| | n | mean | sd | max |
+|---|---|---|---|---|
+| genuine | 8 | 0.469 | 0.090 | 0.610 |
+| **impostor** | 7 | 0.452 | 0.190 | **0.771** |
+
+**d′ = 0.12.** The impostor maximum now *exceeds* the genuine maximum. In that
+run a wrong finger was accepted **3 times out of 10** while the enrolled finger
+was accepted **2 out of 8** — the matcher admits the wrong finger more often
+than the right one. Search-space inflation is therefore **not** the cause, and
+no threshold or window tuning rescues this.
+
 Fixing it means matching on ridge structure rather than raw intensity — Gabor
-enhancement along the local ridge orientation, then correlation over a much
-smaller search window — or a minutiae approach tuned for small-area sensors.
-Until then, treat `elanpress` as a capture driver that proves the hardware
-works, **not** as an authentication mechanism, and do not wire it to PAM.
+enhancement along the local ridge orientation, then correlation — or a minutiae
+approach tuned for small-area sensors. Treat `elanpress` as a **capture driver
+that proves the hardware works**, not as an authentication mechanism, and do not
+wire it to PAM.
 
 ---
 

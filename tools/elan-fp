@@ -217,7 +217,7 @@ stop_debug_daemon() {
 
 # Collect N scores into the file named by $1. Shared by score/impostor.
 collect_scores() {
-  local outfile="$1" i result s threshold=""
+  local outfile="$1" i result s threshold="" seen=0 now=0
   : > "$outfile"
   : > "$LOGDIR/genuine.txt"
   start_debug_daemon || { bad "could not start fprintd with debug"; return 1; }
@@ -226,8 +226,16 @@ collect_scores() {
   for ((i = 1; i <= ITERATIONS; i++)); do
     printf '  %2d/%d ... ' "$i" "$ITERATIONS"
     result=$(run_fprintd "$VERIFY_TIMEOUT" "$LOGDIR/attempt-$i.log" fprintd-verify "$FPUSER")
-    s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
-        | grep -oE "NCC [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
+    # Only accept a score if the driver emitted a NEW line this attempt;
+    # otherwise tail -1 silently repeats the previous attempt's value.
+    now=$(grep -ac "NCC" "$DBG_LOG" 2>/dev/null || echo 0)
+    if (( now > seen )); then
+      s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
+          | grep -oE "NCC [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
+    else
+      s=""
+    fi
+    seen=$now
     if [[ -n $s ]]; then
       printf '%s\n' "$s" >> "$outfile"
       case $result in
@@ -272,17 +280,14 @@ do_impostor() {
   say
   LC_ALL=C awk -v gm="$gm" -v im="$im" -v gsd="$gsd" -v isd="$isd" -v imax="$imax" '
     BEGIN {
-      d = (gsd+isd) > 0 ? (gm-im)/sqrt((gsd*gsd+isd*isd)/2) : 0
-      printf "  separation (d-prime) = %.2f
-
-", d
-      if (d >= 3)      print "  Good separation. A threshold just above the impostor max is defensible."
-      else if (d >= 2) print "  Usable but tight. Set the threshold above impostor worst-case, expect retries."
+      den = sqrt((gsd*gsd + isd*isd) / 2)
+      d = den > 0 ? (gm - im) / den : 0
+      printf("  separation (d-prime) = %.2f\n\n", d)
+      if (d >= 3)      print "  Good separation. A threshold above the impostor max is defensible."
+      else if (d >= 2) print "  Usable but tight. Expect retries."
       else if (d >= 1) print "  Weak. Genuine and impostor distributions overlap materially."
-      else             print "  No meaningful separation. This matcher cannot be made safe by tuning."
-      printf "
-  Any threshold at or below %.3f accepts a wrong finger.
-", imax
+      else             print "  NO meaningful separation. This matcher cannot be made safe by tuning."
+      printf("\n  Any threshold at or below %.3f accepts a wrong finger.\n", imax)
     }'
   return 0
 }
@@ -290,7 +295,7 @@ do_impostor() {
 # Measure the actual match score rather than guessing at the threshold.
 # elanpress logs: "NCC 0.412 (threshold 0.55)"
 do_score() {
-  local i result scores=() s threshold=""
+  local i result scores=() s threshold="" seen=0 now=0
   mkdir -p "$LOGDIR"
 
   if [[ $(current_driver) != elanpress ]]; then
@@ -315,8 +320,16 @@ do_score() {
     printf '  %2d/%d ... ' "$i" "$ITERATIONS"
     result=$(run_fprintd "$VERIFY_TIMEOUT" "$LOGDIR/score-$i.log" fprintd-verify "$FPUSER")
     # Accept both '.' and ',' decimal separators (locale-dependent glib output).
-    s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
-        | grep -oE "NCC [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
+    # Only accept a score if the driver emitted a NEW line this attempt;
+    # otherwise tail -1 silently repeats the previous attempt's value.
+    now=$(grep -ac "NCC" "$DBG_LOG" 2>/dev/null || echo 0)
+    if (( now > seen )); then
+      s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
+          | grep -oE "NCC [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
+    else
+      s=""
+    fi
+    seen=$now
     if [[ -z $threshold ]]; then
       threshold=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
         | grep -oE "threshold [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
