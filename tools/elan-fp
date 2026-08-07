@@ -368,6 +368,20 @@ do_score() {
 
   say "  best $best   mean $mean   worst $worst   threshold $threshold"
   say
+  # If impostor scores exist, they override any advice based on genuine scores
+  # alone: a high genuine score means nothing if impostors reach it too.
+  if [[ -s $LOGDIR/impostor.txt ]]; then
+    local imax
+    imax=$(LC_ALL=C sort -g "$LOGDIR/impostor.txt" | tail -1)
+    local below
+    below=$(LC_ALL=C awk -v x="$imax" '$1 <= x {c++} END {print c+0}' "$LOGDIR/genuine.txt")
+    warn "impostor scores on record: max ${imax}"
+    warn "${below}/${#scores[@]} genuine presses scored at or below that."
+    note "Any threshold accepting them also accepts a wrong finger."
+    note "Do NOT lower the threshold on the strength of the numbers above."
+    return 0
+  fi
+
   LC_ALL=C awk -v b="$best" -v m="$mean" -v t="$threshold" '
     BEGIN {
       if (b >= t)        print "  Some attempts already clear the threshold — presentation consistency is the issue.";
