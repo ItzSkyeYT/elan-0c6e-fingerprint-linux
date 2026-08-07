@@ -12,6 +12,7 @@
 #   elan-fp verify     verify, auto-recovering and retrying on failure
 #   elan-fp enroll     enroll, unwedging first so the attempt isn't wasted
 #   elan-fp test       verify 10x and report a match rate
+#   elan-fp score      measure actual NCC match scores (elanpress only)
 #   elan-fp unwedge    run the recovery ladder on its own
 #   elan-fp doctor     full diagnostic dump for bug reports
 #
@@ -191,6 +192,95 @@ run_fprintd() {
   if grep -q "verify-no-match" "$outfile" 2>/dev/null; then printf 'no-match'; return; fi
   if grep -qi "NoEnrolledPrints\|no.*enrolled" "$outfile" 2>/dev/null; then printf 'no-prints'; return; fi
   printf 'error'
+}
+
+# fprintd.service sets PrivateTmp=yes and is started on demand by D-Bus, so
+# driver-level fp_dbg() output is awkward to reach. Running the daemon by hand
+# with G_MESSAGES_DEBUG=all sidesteps both.
+DBG_LOG=""
+start_debug_daemon() {
+  mkdir -p "$LOGDIR"
+  DBG_LOG="$LOGDIR/driver.log"
+  kill_fprintd
+  as_root sh -c "G_MESSAGES_DEBUG=all /usr/lib/fprintd -t > '$DBG_LOG' 2>&1 &"
+  sleep 2
+  [[ -e $DBG_LOG ]]
+}
+stop_debug_daemon() {
+  as_root pkill -x fprintd 2>/dev/null
+  [[ -n $DBG_LOG ]] && as_root chown "$(id -u):$(id -g)" "$DBG_LOG" 2>/dev/null
+  return 0
+}
+
+# Measure the actual match score rather than guessing at the threshold.
+# elanpress logs: "NCC 0.412 (threshold 0.55)"
+do_score() {
+  local i result scores=() s threshold=""
+  mkdir -p "$LOGDIR"
+
+  if [[ $(current_driver) != elanpress ]]; then
+    bad "this only applies to the elanpress driver"
+    return 1
+  fi
+  if [[ -z $(enrolled_fingers) ]]; then
+    bad "no enrolled prints — run: elan-fp enroll"
+    return 3
+  fi
+
+  need_root
+  say "Measuring match scores over $ITERATIONS attempts."
+  say "Press and hold exactly as you did when enrolling."
+  say
+
+  start_debug_daemon || { bad "could not start fprintd with debug"; return 1; }
+  trap 'stop_debug_daemon' EXIT
+
+  for ((i = 1; i <= ITERATIONS; i++)); do
+    printf '  %2d/%d ... ' "$i" "$ITERATIONS"
+    : > "$DBG_LOG.mark"
+    result=$(run_fprintd "$VERIFY_TIMEOUT" "$LOGDIR/score-$i.log" fprintd-verify "$FPUSER")
+    s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 | grep -oE "NCC [0-9.]+" | awk '{print $2}')
+    [[ -z $threshold ]] && threshold=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 | grep -oE "threshold [0-9.]+" | awk '{print $2}')
+    if [[ -n $s ]]; then
+      scores+=("$s")
+      case $result in
+        match) printf '%sNCC %s  match%s\n'    "$G" "$s" "$N" ;;
+        *)     printf '%sNCC %s  no-match%s\n' "$Y" "$s" "$N" ;;
+      esac
+    else
+      printf '%s%s (no score logged)%s\n' "$R" "$result" "$N"
+    fi
+  done
+
+  stop_debug_daemon; trap - EXIT
+  say
+
+  if (( ${#scores[@]} == 0 )); then
+    bad "no scores captured — the driver never reached the comparison"
+    note "log: $DBG_LOG"
+    return 1
+  fi
+
+  local best worst mean
+  best=$(printf '%s\n' "${scores[@]}" | sort -g | tail -1)
+  worst=$(printf '%s\n' "${scores[@]}" | sort -g | head -1)
+  mean=$(printf '%s\n' "${scores[@]}" | awk '{t+=$1} END {printf "%.3f", t/NR}')
+  threshold=${threshold:-0.55}
+
+  say "  scores: ${scores[*]}"
+  say "  best $best   mean $mean   worst $worst   threshold $threshold"
+  say
+  awk -v b="$best" -v m="$mean" -v t="$threshold" '
+    BEGIN {
+      if (b >= t)        print "  Some attempts already clear the threshold — presentation consistency is the issue.";
+      else if (m >= t*0.8) print "  Close. Genuine scores sit just under the threshold; lowering it is defensible.";
+      else if (m >= t*0.5) print "  Well short. Lowering the threshold this far would weaken security materially.";
+      else                 print "  Very low. This looks like the images are not comparable, not a threshold problem.";
+    }'
+  note "Compare against an impostor score before lowering anything:"
+  note "  enroll a DIFFERENT finger, then verify with the original one."
+  note "  A threshold is only safe if it sits above the impostor distribution."
+  return 0
 }
 
 do_verify() {
@@ -398,7 +488,7 @@ usage() {
 CMD=""
 while (( $# )); do
   case $1 in
-    status|verify|enroll|test|unwedge|doctor) CMD=$1 ;;
+    status|verify|enroll|test|score|unwedge|doctor) CMD=$1 ;;
     --debug) DEBUG=1 ;;
     -n) shift; ITERATIONS=${1:-10} ;;
     -h|--help) usage 0 ;;
@@ -420,6 +510,7 @@ case $CMD in
   verify)  need_root; do_verify ;;
   enroll)  need_root; do_enroll ;;
   test)    do_test ;;
+  score)   do_score ;;
   unwedge) need_root; unwedge 3 ;;
   doctor)  do_doctor ;;
 esac
