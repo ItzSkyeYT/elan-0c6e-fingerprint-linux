@@ -336,11 +336,49 @@ was accepted **2 out of 8** — the matcher admits the wrong finger more often
 than the right one. Search-space inflation is therefore **not** the cause, and
 no threshold or window tuning rescues this.
 
-Fixing it means matching on ridge structure rather than raw intensity — Gabor
-enhancement along the local ridge orientation, then correlation — or a minutiae
-approach tuned for small-area sensors. Treat `elanpress` as a **capture driver
-that proves the hardware works**, not as an authentication mechanism, and do not
-wire it to PAM.
+### What actually limits accuracy: fingertip coverage, not the algorithm
+
+Measured offline on a labelled dataset of 12 right-index and 14 right-middle
+captures (`tools/matcher-lab.py`, `tools/sweep.py`), evaluated the way the driver
+works — a template *set* versus a probe, taking the best score.
+
+**Finding 1 — raw-intensity correlation is worse than chance.** Reimplementing
+the shipped matcher gives **d′ = −0.72**: impostors systematically outscore
+genuine presses.
+
+**Finding 2 — local contrast normalisation is the single biggest algorithmic
+win.** Dividing out local energy removes the pressure/contact-area signal that
+swamps identity. With a rotation search it reaches **d′ ≈ 1.5**.
+
+**Finding 3 — parameter tuning is exhausted.** A 19-variant sweep over LCN
+sigma, rotation range/step, translation window, minimum overlap, both Gabor
+orientation conventions, bandpass and binarisation landed everything between
+**d′ 0.96 and 1.50**. Measured ridge frequency is 0.110 cyc/px (≈9 px period),
+so a hard-coded 0.11 is correct and is *not* the problem.
+
+**Finding 4 — the presses barely overlap.** Only **6 of 66 genuine pairs (9%)**
+score above the best impostor pair; genuine median 0.18 versus impostor median
+0.15. Two presses of the same finger typically correlate no better than presses
+of two different fingers, because a 150×52 window sees a small patch of
+fingertip and placement varies by more than the window is wide.
+
+**Finding 5 — template count dominates everything.**
+
+| enrolled templates | d′ | FAR @ 10% FRR |
+|---|---|---|
+| 1 | 0.68 | 92.9% |
+| 3 | 0.66 | 78.6% |
+| 6 | 1.61 | 21.4% |
+| 10–11 | **2.04** | 28.6% |
+
+Still rising at the edge of the data. `elanpress` enrols 8.
+
+**Conclusion.** The fix is not primarily a better matcher. It is (a) local
+contrast normalisation before correlating, (b) a rotation search, and (c) **many
+more enrolment templates, deliberately covering the fingertip** — which is what
+commercial small-area readers do. Until that is in place, treat `elanpress` as a
+**capture driver that proves the hardware works**, not as an authentication
+mechanism, and do not wire it to PAM.
 
 ---
 
