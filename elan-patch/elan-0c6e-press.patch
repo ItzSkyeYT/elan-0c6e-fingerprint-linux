@@ -1,0 +1,315 @@
+diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+index 1b5d1e70..e50e84eb 100644
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -314,15 +314,94 @@ elan_submit_image (FpImageDevice *dev)
+ 
+   G_DEBUG_HERE ();
+ 
+-  raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
++  /* 0x0c6e is a press sensor — no lifting artifacts, keep all frames */
++  int skip = (self->dev_type & ELAN_0C6E) ? 0 : ELAN_SKIP_LAST_FRAMES;
++  raw_frames = g_slist_nth (self->frames, skip);
+ 
+   assembling_ctx.frame_width = self->frame_width;
+   assembling_ctx.frame_height = self->frame_height;
+-  assembling_ctx.image_width = self->frame_width * 3 / 2;
+-  g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
+-  fpi_do_movement_estimation (&assembling_ctx, frames);
+-  img = fpi_assemble_frames (&assembling_ctx, frames);
+-  img->flags |= FPI_IMAGE_PARTIAL;
++
++  if (self->dev_type & ELAN_0C6E)
++    {
++      /* Press sensor: average all captured frames for better SNR, then submit
++       * as a single complete image without swipe assembly.
++       * Using image_width = frame_width avoids the black side-borders that the
++       * swipe assembler adds (frame_width * 3/2), which cause minutiae detection
++       * to fail on a full-press image. */
++      unsigned int frame_size = self->frame_width * self->frame_height;
++      guint32 *avg = g_malloc0 (frame_size * sizeof (guint32));
++      int n = 0;
++
++      for (GSList *l = raw_frames; l != NULL; l = l->next, n++)
++        {
++          unsigned short *f = l->data;
++          for (unsigned int i = 0; i < frame_size; i++)
++            avg[i] += f[i];
++        }
++
++      unsigned short *avg_frame = g_malloc (frame_size * sizeof (unsigned short));
++      for (unsigned int i = 0; i < frame_size; i++)
++        avg_frame[i] = (n > 0) ? (unsigned short) (avg[i] / n) : 0;
++      g_free (avg);
++
++      /* Debug: show raw pixel statistics to diagnose image quality */
++      {
++        guint32 sum = 0, nonzero = 0;
++        unsigned short pmin = 0xffff, pmax = 0;
++        for (unsigned int i = 0; i < frame_size; i++)
++          {
++            if (avg_frame[i] < pmin) pmin = avg_frame[i];
++            if (avg_frame[i] > pmax) pmax = avg_frame[i];
++            sum += avg_frame[i];
++            if (avg_frame[i] > 0) nonzero++;
++          }
++        fp_dbg ("0x0c6e: averaged %d frames (%dx%d) raw: min=%u max=%u mean=%u nonzero=%u/%u",
++                n, self->frame_width, self->frame_height,
++                pmin, pmax, sum / frame_size, nonzero, frame_size);
++      }
++
++      /* Debug: save raw averaged frame as PGM for visual inspection */
++      {
++        static int dump_count = 0;
++        gchar *path = g_strdup_printf ("/tmp/fp_raw_%d.pgm", dump_count++);
++        GString *buf = g_string_new (NULL);
++        g_string_append_printf (buf, "P5\n%d %d\n255\n",
++                                self->frame_width, self->frame_height);
++        /* Scale 14-bit values to 8-bit for PGM */
++        for (unsigned int i = 0; i < frame_size; i++)
++          g_string_append_c (buf, (gchar) (avg_frame[i] >> 6));
++        g_file_set_contents (path, buf->str, buf->len, NULL);
++        fp_dbg ("0x0c6e: dumped raw frame to %s", path);
++        g_string_free (buf, TRUE);
++        g_free (path);
++      }
++
++      assembling_ctx.image_width = self->frame_width;
++      self->process_frame (avg_frame, &frames);
++      g_free (avg_frame);
++
++      /* fpi_assemble_frames expects delta_x/delta_y to be populated */
++      ((struct fpi_frame *) frames->data)->delta_x = 0;
++      ((struct fpi_frame *) frames->data)->delta_y = 0;
++
++      img = fpi_assemble_frames (&assembling_ctx, frames);
++
++      /* Set standard 500 dpi resolution so NBIS ridge-frequency and quality
++       * calculations work correctly (default ppmm=0 breaks them). */
++      img->ppmm = 19.685;
++
++      /* Mark as partial so NBIS removes unreliable perimeter minutiae —
++       * this reduces false minutiae from the image edges. */
++      img->flags |= FPI_IMAGE_PARTIAL;
++    }
++  else
++    {
++      assembling_ctx.image_width = self->frame_width * 3 / 2;
++      g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
++      fpi_do_movement_estimation (&assembling_ctx, frames);
++      img = fpi_assemble_frames (&assembling_ctx, frames);
++      img->flags |= FPI_IMAGE_PARTIAL;
++    }
+ 
+   g_slist_free_full (frames, g_free);
+ 
+@@ -590,7 +669,9 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
+        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
+     {
+-      if (self->num_frames >= ELAN_MIN_FRAMES)
++      /* Press sensors only need 1 frame since we're averaging, not swiping */
++      int min_frames = (self->dev_type & ELAN_0C6E) ? 1 : ELAN_MIN_FRAMES;
++      if (self->num_frames >= min_frames)
+         {
+           elan_submit_image (dev);
+         }
+@@ -677,6 +758,10 @@ enum calibrate_states {
+ static gboolean
+ elan_supports_calibration (FpiDeviceElan *elandev)
+ {
++  /* 0x0c6e: calibration status polling is unreliable on this device */
++  if (elandev->dev_type & ELAN_0C6E)
++    return FALSE;
++
+   if (elandev->dev_type == ELAN_0C42)
+     return TRUE;
+ 
+@@ -859,10 +944,13 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
+           self->frame_height++;
+           self->raw_frame_height = self->frame_height;
+         }
+-      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
++      /* For swipe sensors the frame is cropped to improve stitching; press
++       * sensors benefit from the full height so NBIS has more pixels. */
++      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT &&
++          !(self->dev_type & ELAN_0C6E))
+         self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+-      fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
+-              self->raw_frame_height);
++      fp_dbg ("sensor dimensions, WxH: %dx%d (raw_h=%d)", self->frame_width,
++              self->frame_height, self->raw_frame_height);
+       fpi_ssm_next_state (ssm);
+       break;
+ 
+@@ -927,6 +1015,15 @@ dev_init (FpImageDevice *dev)
+       break;
+     }
+ 
++  if (self->dev_type & ELAN_0C6E)
++    {
++      /* Press sensor: lower the Bozorth3 match threshold.
++       * Small sensors produce fewer minutiae so raw scores are lower,
++       * but both enrollment and verify images come from the same sensor
++       * in the same way, so a lower threshold is still secure. */
++      fpi_image_device_set_bz3_threshold (dev, 20);
++    }
++
+   fpi_image_device_open_complete (dev, NULL);
+ }
+ 
+diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
+index 7d089945..4f9ad50e 100644
+--- a/libfprint/drivers/elan.h
++++ b/libfprint/drivers/elan.h
+@@ -31,6 +31,8 @@
+ #define ELAN_0907 (1 << 0)
+ #define ELAN_0C03 (1 << 1)
+ #define ELAN_0C42 (1 << 2)
++/* 0x0c6e: calibration status polling is unreliable; skip it */
++#define ELAN_0C6E (1 << 3)
+ 
+ /* devices which don't require frame rotation before assembling */
+ #define ELAN_NOT_ROTATED ELAN_0C03
+@@ -219,7 +221,7 @@ static const FpIdEntry elan_id_table[] = {
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c63, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_ALL_DEV},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_0C6E},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c58, .driver_data = ELAN_ALL_DEV},
+   {.vid = 0,  .pid = 0,  .driver_data = 0},
+ };
+diff --git a/libfprint/drivers/elanmoc/elanmoc.c b/libfprint/drivers/elanmoc/elanmoc.c
+index 406a37bd..3fdbc2e4 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.c
++++ b/libfprint/drivers/elanmoc/elanmoc.c
+@@ -87,6 +87,18 @@ elanmoc_cmd_ack_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
++  /* 0x0c6e uses a non-standard ACK format; log what we get and proceed */
++  {
++    gint productid = g_usb_device_get_pid (fpi_device_get_usb_device (FP_DEVICE (self)));
++    if (productid == 0x0c6e)
++      {
++        fp_dbg ("elanmoc 0x0c6e ack: 0x%.2X 0x%.2X (len=%zu)",
++                buffer_in[0], length_in > 1 ? buffer_in[1] : 0x00, length_in);
++        fpi_ssm_next_state (self->task_ssm);
++        return;
++      }
++  }
++
+   if (buffer_in[0] != 0x40 && buffer_in[1] != 0x00 )
+     {
+       fpi_ssm_mark_failed (self->task_ssm,
+@@ -175,14 +187,25 @@ fp_cmd_run_state (FpiSsm   *ssm,
+           fpi_ssm_mark_completed (ssm);
+           return;
+         }
+-      transfer = fpi_usb_transfer_new (dev);
+-      transfer->ssm = ssm;
+-      fpi_usb_transfer_fill_bulk (transfer, self->cmd_cancelable ? ELAN_EP_MOC_CMD_IN : ELAN_EP_CMD_IN, self->cmd_len_in);
+-      fpi_usb_transfer_submit (transfer,
+-                               self->cmd_cancelable ? 0 : ELAN_MOC_CMD_TIMEOUT,
+-                               self->cmd_cancelable ? fpi_device_get_cancellable (dev) : NULL,
+-                               fp_cmd_receive_cb,
+-                               fpi_ssm_get_data (ssm));
++      {
++        gint productid = g_usb_device_get_pid (fpi_device_get_usb_device (dev));
++        gboolean no_ep84 = (productid == 0x0c6e);
++        guint8 ep_in = (self->cmd_cancelable && !no_ep84) ? ELAN_EP_MOC_CMD_IN : ELAN_EP_CMD_IN;
++        transfer = fpi_usb_transfer_new (dev);
++        transfer->ssm = ssm;
++        /* 0x0c6e lacks EP 0x84; allow short reads so we can receive its 1-byte
++         * "no finger yet" (0x98) response on EP 0x83 without triggering an error.
++         * Also use a full 64-byte buffer to avoid OVERFLOW when the device returns
++         * more bytes than the command's nominal resp_len. */
++        transfer->short_is_error = !no_ep84;
++        gsize read_len = no_ep84 ? 64 : self->cmd_len_in;
++        fpi_usb_transfer_fill_bulk (transfer, ep_in, read_len);
++        fpi_usb_transfer_submit (transfer,
++                                 self->cmd_cancelable ? 0 : ELAN_MOC_CMD_TIMEOUT,
++                                 self->cmd_cancelable ? fpi_device_get_cancellable (dev) : NULL,
++                                 fp_cmd_receive_cb,
++                                 fpi_ssm_get_data (ssm));
++      }
+       break;
+ 
+     }
+@@ -306,6 +329,20 @@ elanmoc_get_enrolled_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
++  /* 0x0c6e returns a non-standard response that cannot be parsed as an enrolled
++   * count; assume 0 enrolled fingers so the next fingerprint uses slot 0. */
++  {
++    gint productid = g_usb_device_get_pid (fpi_device_get_usb_device (FP_DEVICE (self)));
++    if (productid == 0x0c6e)
++      {
++        fp_dbg ("elanmoc 0x0c6e enrolled response: 0x%.2X 0x%.2X (len=%zu) — forcing curr_enrolled=0",
++                buffer_in[0], length_in > 1 ? buffer_in[1] : 0x00, length_in);
++        self->curr_enrolled = 0;
++        fpi_ssm_next_state (self->task_ssm);
++        return;
++      }
++  }
++
+   if (buffer_in[0] != 0x40)
+     {
+       fpi_ssm_mark_failed (self->task_ssm,
+@@ -370,6 +407,16 @@ elanmoc_enroll_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
++  /* 0x0c6e returns a single 0x98 byte on EP 0x83 meaning "no finger detected
++   * yet" (sensor-side timeout).  Retry silently so the user gets a normal
++   * "place your finger" prompt rather than an instant failure. */
++  if (length_in == 1 && buffer_in[0] == 0x98)
++    {
++      fp_dbg ("elanmoc: sensor waiting for finger (0x98), retrying enroll");
++      fpi_ssm_jump_to_state (self->task_ssm, MOC_ENROLL_WAIT_FINGER);
++      return;
++    }
++
+   if (buffer_in[0] != 0x40)
+     {
+       fpi_ssm_mark_failed (self->task_ssm,
+@@ -787,6 +834,14 @@ elanmoc_identify_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
++  /* 0x0c6e: 0x98 = sensor waiting for finger, retry */
++  if (length_in == 1 && buffer_in[0] == 0x98)
++    {
++      fp_dbg ("elanmoc: sensor waiting for finger (0x98), retrying identify");
++      fpi_ssm_jump_to_state (self->task_ssm, IDENTIFY_WAIT_FINGER);
++      return;
++    }
++
+   if (buffer_in[1] == ELAN_MSG_VERIFY_ERR)
+     identify_status_report (self, RSP_VERIFY_FAIL,
+                             buffer_in[1], error);
+@@ -1046,9 +1101,19 @@ dev_init_handler (FpiSsm *ssm, FpDevice *dev)
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+     case DEV_WAIT_READY:
+-      self->cmd_retry_cnt = ELAN_MOC_CAL_RETRY;
+-      cmd_buf = elanmoc_compose_cmd (&cal_status_cmd);
+-      elanmoc_get_cmd (dev, cmd_buf, cal_status_cmd.cmd_len, cal_status_cmd.resp_len, 0, elanmoc_get_status_cb);
++      {
++        gint productid = g_usb_device_get_pid (fpi_device_get_usb_device (dev));
++        if (productid == 0x0c6e)
++          {
++            /* 0x0c6e does not use the standard calibration status protocol
++             * (never returns 0x03); skip directly to mode setup */
++            fpi_ssm_next_state (ssm);
++            break;
++          }
++        self->cmd_retry_cnt = ELAN_MOC_CAL_RETRY;
++        cmd_buf = elanmoc_compose_cmd (&cal_status_cmd);
++        elanmoc_get_cmd (dev, cmd_buf, cal_status_cmd.cmd_len, cal_status_cmd.resp_len, 0, elanmoc_get_status_cb);
++      }
+       break;
+ 
+     case DEV_SET_MODE:

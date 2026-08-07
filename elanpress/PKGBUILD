@@ -1,0 +1,39 @@
+# Maintainer: melb
+# libfprint with the out-of-tree "elanpress" driver for ELAN 04f3:0c6e
+# (ASUS ROG Flow X13 GV301QH power-button press sensor).
+#
+# Source: https://github.com/Quoteme/libfprint branch "elanpress"
+# which merges "fix-rog-flow-x13" (removes the pre-scan finger-presence check
+# that wedges this sensor after one capture per power-up).
+#
+# Unlike the stock "elan" driver this does NOT use NBIS/bozorth3 minutiae
+# matching -- a 150x52 sensor yields too few minutiae -- it matches by
+# normalized cross-correlation with rotation tolerance instead.
+
+pkgname=libfprint-elanpress
+_commit=9e6ea5a04df063fce25dace4093a237ae24e3cd4
+pkgver=1.94.9.elanpress
+pkgrel=1
+pkgdesc="libfprint with elanpress driver for ELAN 0C6E press sensors (ROG Flow X13)"
+url="https://github.com/Quoteme/libfprint"
+arch=(x86_64)
+license=('LGPL-2.1-or-later')
+depends=(libgusb pixman nss systemd libgudev)
+makedepends=(git meson gobject-introspection)
+conflicts=(libfprint)
+provides=(libfprint libfprint-2.so=2-64)
+groups=(fprint)
+source=("libfprint::git+file:///home/melb/projects/libfprint-elanpress#commit=${_commit}")
+sha256sums=('SKIP')
+
+build() {
+  arch-meson libfprint build \
+    -D doc=false \
+    -D gtk-examples=false \
+    -D introspection=false
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

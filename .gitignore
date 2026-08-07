@@ -1,0 +1,15 @@
+# NEVER commit biometric data — fingerprint captures stay local.
+*.pgm
+*.pnm
+finger.*
+fp_raw_*
+fp_f*_*
+fp_enhanced_*
+fp_scaled_*
+
+# build artefacts
+*.pkg.tar.zst
+*.log
+src/
+pkg/
+build/

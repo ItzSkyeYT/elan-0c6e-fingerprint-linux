@@ -1,0 +1,44 @@
+# Maintainer: melb
+# Adds elanmoc support for ELAN 04f3:0c6e (ROG Flow X13)
+# Based on the elanmoc2 branch from geodic/libfprint
+
+pkgname=libfprint-elan0c6e
+_pkgname=libfprint
+pkgver=1.94.10+12+gd79f1572
+pkgrel=1
+pkgdesc="Library for fingerprint readers with elanmoc support for ELAN 0C6E"
+url="https://fprint.freedesktop.org/"
+arch=(x86_64)
+license=('LGPL-2.1-or-later')
+depends=(libgusb pixman nss systemd libgudev)
+makedepends=(git meson gobject-introspection)
+conflicts=(libfprint)
+provides=(libfprint libfprint-2.so=2-64)
+groups=(fprint)
+source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git"
+        "elan0c6e-elanmoc.patch")
+sha256sums=('SKIP' 'SKIP')
+
+pkgver() {
+  cd $_pkgname
+  git describe --tags | sed 's/^v//;s/^V_//;s/_/./g;s/-/+/g'
+}
+
+prepare() {
+  cd $_pkgname
+  patch -p1 < "$srcdir/elan0c6e-elanmoc.patch" || {
+    echo "Patch failed — trying with --fuzz 3"
+    patch -p1 --fuzz 3 < "$srcdir/elan0c6e-elanmoc.patch"
+  }
+}
+
+build() {
+  arch-meson $_pkgname build \
+    -D doc=false \
+    -D gtk-examples=false
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}
