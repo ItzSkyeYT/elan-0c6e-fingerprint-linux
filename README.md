@@ -292,6 +292,7 @@ If you have `04f3:0c6e`, please open a PR adding a row.
 | ASUS ROG Flow X13 GV301QH | `0x0161` | stock `elan` 1.94.100 | ✗ | — | proto error in capture |
 | ASUS ROG Flow X13 GV301QH | `0x0161` | patched `elan` (press averaging) | ✓ | 0/5 | captures show real ridges; never matches |
 | ASUS ROG Flow X13 GV301QH | `0x0161` | `elanpress` (template from wedged device) | ✓ 8 stages | 4/9 | mean NCC 0.581, sd 0.159 |
+| ASUS ROG Flow X13 GV301QH | `0x0161` | offline: LCN + rotation + 30 templates | — | d′ 1.54, EER 20% | best measured; see findings |
 | **ASUS ROG Flow X13 GV301QH** | **`0x0161`** | **`elanpress` (template from healthy device)** | **✓** | **8/10** | **stock 0.55 threshold, no hangs** |
 
 ### ⚠️ `elanpress`'s matcher does not discriminate — do not use it for auth
@@ -372,6 +373,31 @@ fingertip and placement varies by more than the window is wide.
 | 10–11 | **2.04** | 28.6% |
 
 Still rising at the edge of the data. `elanpress` enrols 8.
+
+**Finding 6 — more templates help, then saturate.** Averaged over random
+template subsets (a fixed ordering gives an optimistic selection effect):
+
+| enrolled templates | d′ | EER |
+|---|---|---|
+| 1 | 0.56 | 35.8% |
+| 10 | 1.21 | 28.4% |
+| 20 | 1.40 | 22.9% |
+| 30 | 1.54 | 20.4% |
+
+Nearly a tripling from 1 to 30, but flattening after ~20.
+
+**Finding 7 — band-limited phase-only correlation performs *worse*, not better.**
+BLPOC is the standard recommendation for small-area fingerprint sensors (Ito et
+al. 2004), and it is implemented and sanity-checked here (`tools/poc.py`,
+`blpoc(a,a) = 1.0000`). On this data it scores **d′ 0.09–0.52** against NCC's
+1.54, across full-band and band-limited variants, with and without LCN.
+
+The reason is the same overlap problem: POC assumes two views of the *same
+scene* under translation and correlates phase over the whole image, so partial
+overlap degrades it more than NCC, which restricts to an explicit overlap region
+with a minimum-area constraint. **Do not assume the small-area literature
+transfers here** — those results come from sensors where successive captures see
+substantially the same region.
 
 **Conclusion.** The fix is not primarily a better matcher. It is (a) local
 contrast normalisation before correlating, (b) a rotation search, and (c) **many
