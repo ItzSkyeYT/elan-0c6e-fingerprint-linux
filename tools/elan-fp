@@ -13,6 +13,7 @@
 #   elan-fp enroll     enroll, unwedging first so the attempt isn't wasted
 #   elan-fp test       verify 10x and report a match rate
 #   elan-fp score      measure actual NCC match scores (elanpress only)
+#   elan-fp impostor   measure WRONG-finger scores — decides if tuning is safe
 #   elan-fp unwedge    run the recovery ladder on its own
 #   elan-fp doctor     full diagnostic dump for bug reports
 #
@@ -200,15 +201,89 @@ run_fprintd() {
 DBG_LOG=""
 start_debug_daemon() {
   mkdir -p "$LOGDIR"
-  DBG_LOG="$LOGDIR/driver.log"
+  # Timestamped: a fixed name gets truncated by the next run, destroying the
+  # previous session's scores.
+  DBG_LOG="$LOGDIR/driver-$(date +%Y%m%d-%H%M%S).log"
   kill_fprintd
-  as_root sh -c "G_MESSAGES_DEBUG=all /usr/lib/fprintd -t > '$DBG_LOG' 2>&1 &"
+  as_root sh -c "LC_ALL=C G_MESSAGES_DEBUG=all /usr/lib/fprintd -t > '$DBG_LOG' 2>&1 &"
   sleep 2
   [[ -e $DBG_LOG ]]
 }
 stop_debug_daemon() {
   as_root pkill -x fprintd 2>/dev/null
   [[ -n $DBG_LOG ]] && as_root chown "$(id -u):$(id -g)" "$DBG_LOG" 2>/dev/null
+  return 0
+}
+
+# Collect N scores into the file named by $1. Shared by score/impostor.
+collect_scores() {
+  local outfile="$1" i result s threshold=""
+  : > "$outfile"
+  : > "$LOGDIR/genuine.txt"
+  start_debug_daemon || { bad "could not start fprintd with debug"; return 1; }
+  trap 'stop_debug_daemon' EXIT
+
+  for ((i = 1; i <= ITERATIONS; i++)); do
+    printf '  %2d/%d ... ' "$i" "$ITERATIONS"
+    result=$(run_fprintd "$VERIFY_TIMEOUT" "$LOGDIR/attempt-$i.log" fprintd-verify "$FPUSER")
+    s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
+        | grep -oE "NCC [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
+    if [[ -n $s ]]; then
+      printf '%s\n' "$s" >> "$outfile"
+      case $result in
+        match) printf '%sNCC %s  match%s\n'    "$G" "$s" "$N" ;;
+        *)     printf '%sNCC %s  no-match%s\n' "$Y" "$s" "$N" ;;
+      esac
+    else
+      printf '%s%s (no score logged)%s\n' "$R" "$result" "$N"
+    fi
+  done
+  stop_debug_daemon; trap - EXIT
+  [[ -s $outfile ]]
+}
+
+stats_of() {
+  LC_ALL=C awk '{v[NR]=$1; t+=$1; if($1>mx)mx=$1; if(mn==""||$1<mn)mn=$1}
+    END {if(NR==0){print "0 0 0 0";exit} m=t/NR
+         for(i=1;i<=NR;i++) sd+=(v[i]-m)^2
+         printf "%d %.3f %.3f %.3f %.3f", NR, m, sqrt(sd/NR), mx, mn}' "$1"
+}
+
+# Present a DIFFERENT finger against the existing template. Those scores are
+# the impostor distribution -- the only thing that makes a threshold choice
+# defensible rather than wishful.
+do_impostor() {
+  local gen="$LOGDIR/genuine.txt" imp="$LOGDIR/impostor.txt"
+  if [[ ! -s $gen ]]; then
+    bad "no genuine baseline yet — run: elan-fp score"
+    return 1
+  fi
+  need_root
+  say "${Y}Use a DIFFERENT finger${N} than the enrolled one for all $ITERATIONS presses."
+  say "These scores are what an attacker would achieve."
+  say
+  collect_scores "$imp" || return 1
+
+  read -r gn gm gsd gmax _ <<<"$(stats_of "$gen")"
+  read -r inn im isd imax _ <<<"$(stats_of "$imp")"
+  say
+  say "  genuine   n=$gn  mean=$gm  sd=$gsd  best=$gmax"
+  say "  impostor  n=$inn  mean=$im  sd=$isd  ${R}worst-case=$imax${N}"
+  say
+  LC_ALL=C awk -v gm="$gm" -v im="$im" -v gsd="$gsd" -v isd="$isd" -v imax="$imax" '
+    BEGIN {
+      d = (gsd+isd) > 0 ? (gm-im)/sqrt((gsd*gsd+isd*isd)/2) : 0
+      printf "  separation (d-prime) = %.2f
+
+", d
+      if (d >= 3)      print "  Good separation. A threshold just above the impostor max is defensible."
+      else if (d >= 2) print "  Usable but tight. Set the threshold above impostor worst-case, expect retries."
+      else if (d >= 1) print "  Weak. Genuine and impostor distributions overlap materially."
+      else             print "  No meaningful separation. This matcher cannot be made safe by tuning."
+      printf "
+  Any threshold at or below %.3f accepts a wrong finger.
+", imax
+    }'
   return 0
 }
 
@@ -232,17 +307,23 @@ do_score() {
   say "Press and hold exactly as you did when enrolling."
   say
 
+  : > "$LOGDIR/genuine.txt"
   start_debug_daemon || { bad "could not start fprintd with debug"; return 1; }
   trap 'stop_debug_daemon' EXIT
 
   for ((i = 1; i <= ITERATIONS; i++)); do
     printf '  %2d/%d ... ' "$i" "$ITERATIONS"
-    : > "$DBG_LOG.mark"
     result=$(run_fprintd "$VERIFY_TIMEOUT" "$LOGDIR/score-$i.log" fprintd-verify "$FPUSER")
-    s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 | grep -oE "NCC [0-9.]+" | awk '{print $2}')
-    [[ -z $threshold ]] && threshold=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 | grep -oE "threshold [0-9.]+" | awk '{print $2}')
+    # Accept both '.' and ',' decimal separators (locale-dependent glib output).
+    s=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
+        | grep -oE "NCC [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
+    if [[ -z $threshold ]]; then
+      threshold=$(grep -a "NCC" "$DBG_LOG" 2>/dev/null | tail -1 \
+        | grep -oE "threshold [0-9]+[.,][0-9]+" | awk '{print $2}' | tr ',' '.')
+    fi
     if [[ -n $s ]]; then
       scores+=("$s")
+      printf '%s\n' "$s" >> "$LOGDIR/genuine.txt"
       case $result in
         match) printf '%sNCC %s  match%s\n'    "$G" "$s" "$N" ;;
         *)     printf '%sNCC %s  no-match%s\n' "$Y" "$s" "$N" ;;
@@ -262,15 +343,15 @@ do_score() {
   fi
 
   local best worst mean
-  best=$(printf '%s\n' "${scores[@]}" | sort -g | tail -1)
-  worst=$(printf '%s\n' "${scores[@]}" | sort -g | head -1)
-  mean=$(printf '%s\n' "${scores[@]}" | awk '{t+=$1} END {printf "%.3f", t/NR}')
+  best=$(printf '%s\n' "${scores[@]}" | LC_ALL=C sort -g | tail -1)
+  worst=$(printf '%s\n' "${scores[@]}" | LC_ALL=C sort -g | head -1)
+  mean=$(printf '%s\n' "${scores[@]}" | LC_ALL=C awk '{t+=$1} END {printf "%.3f", t/NR}')
   threshold=${threshold:-0.55}
 
   say "  scores: ${scores[*]}"
   say "  best $best   mean $mean   worst $worst   threshold $threshold"
   say
-  awk -v b="$best" -v m="$mean" -v t="$threshold" '
+  LC_ALL=C awk -v b="$best" -v m="$mean" -v t="$threshold" '
     BEGIN {
       if (b >= t)        print "  Some attempts already clear the threshold — presentation consistency is the issue.";
       else if (m >= t*0.8) print "  Close. Genuine scores sit just under the threshold; lowering it is defensible.";
@@ -488,7 +569,7 @@ usage() {
 CMD=""
 while (( $# )); do
   case $1 in
-    status|verify|enroll|test|score|unwedge|doctor) CMD=$1 ;;
+    status|verify|enroll|test|score|impostor|unwedge|doctor) CMD=$1 ;;
     --debug) DEBUG=1 ;;
     -n) shift; ITERATIONS=${1:-10} ;;
     -h|--help) usage 0 ;;
@@ -511,6 +592,7 @@ case $CMD in
   enroll)  need_root; do_enroll ;;
   test)    do_test ;;
   score)   do_score ;;
+  impostor) do_impostor ;;
   unwedge) need_root; unwedge 3 ;;
   doctor)  do_doctor ;;
 esac
