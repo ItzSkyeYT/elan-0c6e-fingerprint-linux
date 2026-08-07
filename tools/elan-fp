@@ -349,6 +349,23 @@ do_score() {
   threshold=${threshold:-0.55}
 
   say "  scores: ${scores[*]}"
+  # Drift vs scatter: a declining trend points at the sensor or the finger
+  # degrading across the run; scatter points at placement variance. These are
+  # indistinguishable from pass/fail counts alone.
+  printf '%s\n' "${scores[@]}" | LC_ALL=C awk '
+    {v[NR]=$1}
+    END {
+      if (NR < 6) exit
+      h = int(NR/2)
+      for (i=1;i<=h;i++)      a+=v[i]
+      for (i=NR-h+1;i<=NR;i++) b+=v[i]
+      a/=h; b/=h; d=a-b
+      printf "  first half %.3f  ->  second half %.3f   (drift %+.3f)\n", a, b, d
+      if (d > 0.06)       print "  ! declining across the run — sensor or finger degrading, not placement."
+      else if (d < -0.06) print "  ! improving across the run — likely technique settling in."
+      else                print "  no drift — variance is placement/presentation, not degradation."
+    }'
+
   say "  best $best   mean $mean   worst $worst   threshold $threshold"
   say
   LC_ALL=C awk -v b="$best" -v m="$mean" -v t="$threshold" '

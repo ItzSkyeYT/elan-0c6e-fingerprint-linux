@@ -294,6 +294,40 @@ If you have `04f3:0c6e`, please open a PR adding a row.
 | ASUS ROG Flow X13 GV301QH | `0x0161` | `elanpress` (template from wedged device) | ✓ 8 stages | 4/9 | mean NCC 0.581, sd 0.159 |
 | **ASUS ROG Flow X13 GV301QH** | **`0x0161`** | **`elanpress` (template from healthy device)** | **✓** | **8/10** | **stock 0.55 threshold, no hangs** |
 
+### ⚠️ `elanpress`'s matcher does not discriminate — do not use it for auth
+
+Measured on a GV301QH (firmware `0x0161`), presenting a **different finger**
+against an enrolled template:
+
+| | NCC | Outcome |
+|---|---|---|
+| genuine | 0.364 | no-match |
+| genuine | 0.364 | no-match |
+| **impostor** | **0.578** | **ACCEPTED at the stock 0.55 threshold** |
+| impostor | 0.536 | no-match |
+| impostor | 0.459 | no-match |
+| impostor | 0.338 | no-match |
+
+Genuine mean ≈ 0.54 (sd 0.17), impostor mean ≈ 0.48 (sd 0.09) → **d′ ≈ 0.5**.
+A wrong finger repeatedly outscored the correct one. **No threshold separates
+these distributions**, so the 8/10 genuine match rate above is not evidence of a
+working biometric — it is a coin weighted slightly in your favour.
+
+The likely cause is structural, not a tuning error: `elanpress_ncc_best` takes
+the **maximum** zero-mean NCC over ±60px × ±20px translation and ±12° rotation —
+on the order of 35,000 candidate alignments — computed on **raw, unenhanced**
+pixels. Maximising over that many trials inflates the score for any pair of
+textured images, which is exactly the observed symptom (and also why a single
+verification takes seconds).
+
+Fixing it means matching on ridge structure rather than raw intensity — Gabor
+enhancement along the local ridge orientation, then correlation over a much
+smaller search window — or a minutiae approach tuned for small-area sensors.
+Until then, treat `elanpress` as a capture driver that proves the hardware
+works, **not** as an authentication mechanism, and do not wire it to PAM.
+
+---
+
 **The single biggest factor is enrolling on a non-wedged device.** The same
 driver and threshold went from 4/9 to 8/10 purely by re-enrolling after a
 successful USB selective-suspend recovery. If your match rate is poor, re-enroll
