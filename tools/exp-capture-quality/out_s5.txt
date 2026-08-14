@@ -1,0 +1,52 @@
+==============================================================================
+15a. RIDGE PERIOD (from the LCN autocorrelation)
+==============================================================================
+   ridge period: median 10.0 px (p10 10.0, p90 12.0)
+   at 508 dpi that is 0.50 mm, a normal adult ridge pitch (0.4-0.6 mm)
+   the 52-px short axis therefore spans only 5.2 ridges
+
+==============================================================================
+15b. SELF-AMBIGUITY: how well does a capture match a WRONG shift of
+     ITSELF?  (the alias floor every matcher has to beat)
+==============================================================================
+   self-NCC at the best shift >=4 px from the truth: median 0.611  p10 0.502  p90 0.753
+   best genuine CROSS-capture score, over all 465 pairs: median 0.163  max 0.570
+   best impostor cross-capture score: median 0.137  max 0.447
+
+   The alias floor (0.61) is 3.8x the median genuine score.
+   A wrong alignment of the SAME image scores far higher than the
+   right alignment of a second press. Correlation cannot register
+   these captures; the peak it reports is an alias, not the truth.
+
+==============================================================================
+15c. ORIENTATION SPREAD WITHIN ONE FRAME
+==============================================================================
+   circular sd of ridge orientation inside one capture: median 17.1 deg (p10 9.2, p90 27.6)
+   captures with spread < 20 deg (essentially parallel ridges): 67%
+   Parallel ridges are translation-ambiguous along the ridge, which
+   is exactly the 150-px long axis of this sensor.
+
+==============================================================================
+15d. SENSOR AREA AND THE MINUTIA BUDGET
+==============================================================================
+   frame = 150 x 52 px at 508 dpi = 7.5 x 2.6 mm = 19.5 mm^2
+   median finger contact area = 80% of that = 15.6 mm^2
+   at 0.20 minutiae/mm^2 (conservative): 3.1 minutiae per capture
+   at 0.30 minutiae/mm^2 (typical): 4.7 minutiae per capture
+   BOZORTH3 needs roughly 12 matched minutiae for a confident
+   decision, and two partial presses share only part of even that.
+   This is an upper bound set by the SENSOR, not by the driver.
+
+==============================================================================
+15e. WHAT DOES FRAME AVERAGING COST? (can only be bounded here --
+     the dataset stores the driver's already-averaged output)
+==============================================================================
+   Every capture is the mean of 3-10 raw frames; the raw frames are
+   not retained, so no measurement of the averaging can be made from
+   this dataset. What CAN be said: the residual sensor noise after
+   averaging is already far below the ridge signal --
+     RMS(above-ridge-band) / RMS(ridge band) = median 0.250  p90 0.319
+   i.e. out-of-band residual is ~25% of ridge amplitude (and that
+   figure over-counts, since the 0.8-sigma split leaks ridge energy).
+   Removing ALL of it could not move a d' of 1.4; the failure is
+   geometric, not SNR.

@@ -13,3 +13,28 @@ fp_scaled_*
 src/
 pkg/
 build/
+
+# --- biometric data: NEVER commit anything derived from a capture ---
+# Fingerprint minutiae templates are biometric data in their own right --
+# arguably more sensitive than the images, since they are the matchable form.
+*.xyt
+*.min
+*.wsq
+*.raw
+# Numpy caches from the experiments hold image patches and descriptor sets
+# computed directly from captures.
+*.npy
+*.npz
+# Montages / renders of captures
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+# Compiled artefacts
+__pycache__/
+*.pyc
+# Compiled binaries from the NBIS experiment
+tools/exp-nbis/nbisbatch
+tools/exp-nbis/mdt

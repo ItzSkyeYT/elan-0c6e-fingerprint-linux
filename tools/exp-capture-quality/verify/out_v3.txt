@@ -1,0 +1,268 @@
+==============================================================================
+1. PER-IMAGE CAPTURE QUALITY, BY CLASS  (mean over the class)
+==============================================================================
+  metric                   right-index   right-index-cover        right-middle
+  aniso_fg                       0.747               0.727               0.643
+  aniso_w                        0.759               0.733               0.644
+  blk_energy_med               537.661             527.441             402.229
+  bp_energy                     24.360              24.099              20.817
+  coh_fg                         0.915               0.910               0.877
+  coh_w                          0.919               0.909               0.883
+  dyn_range                    154.754             147.742             170.500
+  fg_frac                        0.824               0.806               0.667
+  ridge_band                     0.311               0.298               0.310
+  sat_hi                         0.000               0.000               0.000
+  sat_lo                         0.017               0.007               0.041
+  std                           48.907              46.938              54.072
+  usable_frac                    0.684               0.642               0.470
+
+  finger (foreground) pixels per image, median by class: right-index=6568 (84% of frame), right-index-cover=6696 (86% of frame), right-middle=5248 (67% of frame)
+
+  composite quality (mean of 4 rank-normalised metrics):
+    right-index          mean=0.616 min=0.114 max=0.852
+    right-index-cover    mean=0.519 min=0.062 max=0.943
+    right-middle         mean=0.375 min=0.068 max=0.778
+
+==============================================================================
+2. DOES CAPTURE QUALITY PREDICT MATCH SCORE?
+==============================================================================
+
+(a) genuine PAIRS (n=465): Spearman rho of the pair score
+    against the min / mean quality of the two images
+    metric            rho(min)       p  rho(mean)       p
+    aniso_fg             0.110  0.0215      0.072  0.1189
+    aniso_w              0.192  0.0005      0.138  0.0045
+    blk_energy_med       0.287  0.0005      0.266  0.0005
+    bp_energy            0.330  0.0005      0.289  0.0005
+    coh_fg               0.044  0.3613      0.028  0.5517
+    coh_w                0.103  0.0330      0.059  0.2039
+    dyn_range            0.123  0.0070     -0.027  0.5577
+    fg_frac              0.261  0.0005      0.256  0.0005
+    ridge_band           0.238  0.0005      0.207  0.0005
+    sat_hi               0.072  0.1234      0.018  0.6992
+    sat_lo              -0.008  0.8641     -0.177  0.0005
+    std                  0.093  0.0435     -0.048  0.3033
+    usable_frac          0.238  0.0005      0.236  0.0005
+
+(b) per genuine IMAGE (n=31): rho of its own quality against
+    its mean, and its max, score versus the other 30 genuine captures
+    metric            rho(mean)       p  rho(max)       p
+    aniso_fg              0.406  0.0220     0.525  0.0018
+    aniso_w               0.516  0.0034     0.503  0.0032
+    blk_energy_med        0.411  0.0222    -0.032  0.8684
+    bp_energy             0.444  0.0134     0.050  0.7910
+    coh_fg                0.292  0.1070     0.411  0.0188
+    coh_w                 0.342  0.0618     0.375  0.0356
+    dyn_range             0.041  0.8304     0.241  0.1894
+    fg_frac               0.272  0.1302    -0.176  0.3391
+    ridge_band            0.597  0.0006     0.521  0.0020
+    sat_hi                0.108  0.5501     0.068  0.7181
+    sat_lo               -0.183  0.3157     0.009  0.9580
+    std                  -0.008  0.9654     0.177  0.3375
+    usable_frac           0.483  0.0042     0.124  0.4915
+
+    strongest single predictor of mean genuine score: ridge_band (rho=+0.597, r^2=36% of rank variance)
+
+(c) are the WORST genuine pairs made of low-quality images?
+    20 WORST pairs: score 0.077, min-of-pair composite quality 0.652
+    20 BEST pairs: score 0.394, min-of-pair composite quality 0.608
+    (composite quality of all genuine images: 0.557)
+
+==============================================================================
+3. WHAT DOES A CAPTURE-TIME QUALITY GATE BUY?
+==============================================================================
+  Every gated figure is paired with a RANDOM-DROP control that removes
+  the same number of images at random (60 draws). If the gate does no
+  better than random, the metric carries no usable information.
+  Dropping is done WITHIN class, so it cannot flatter the impostor set.
+
+  BASELINE (no gate)
+    A pooled   (n_enroll=15, 300 random subsets):  d'= 1.27+-0.28  EER= 25.5%  FAR@10%FRR= 38.5%
+    B realistic(enrol 19 cover, probe 12 index):    d'= 1.84         EER= 15.5%  FAR@10%FRR= 14.3%
+
+  --------------------------------------------------------------------------
+  MODE ENROL-ONLY   (probe sets unchanged -- clean comparison)
+  gate metric     drop |           A d-prime |          A EER% |       A FAR@10% |           B d-prime
+                       |    gated     random |  gated     rand |  gated     rand |    gated     random
+  ridge_band       10% |     1.19   1.31+-0.10 |   27.3     25.4 |   41.8     38.9 |     1.84   1.82+-0.14
+  ridge_band       20% |     1.08   1.32+-0.13 |   29.6     25.1 |   43.5     38.3 |     1.72   1.73+-0.25
+  ridge_band       30% |     1.01   1.31+-0.18 |   31.2     25.2 |   46.3     39.8 |     1.12   1.67+-0.26
+  aniso_w          10% |     1.17   1.31+-0.10 |   28.1     25.4 |   43.0     38.9 |     1.84   1.82+-0.14
+  aniso_w          20% |     1.13   1.32+-0.13 |   28.4     25.1 |   40.9     38.3 |     1.78   1.73+-0.25
+  aniso_w          30% |     1.11   1.31+-0.18 |   28.8     25.2 |   42.5     39.8 |     1.70   1.67+-0.26
+  coh_w            10% |     1.17   1.31+-0.10 |   28.1     25.4 |   43.0     38.9 |     1.84   1.82+-0.14
+  coh_w            20% |     1.16   1.32+-0.13 |   27.9     25.1 |   39.5     38.3 |     1.82   1.73+-0.25
+  coh_w            30% |     1.13   1.31+-0.18 |   29.3     25.2 |   41.7     39.8 |     1.11   1.67+-0.26
+  usable_frac      10% |     1.28   1.31+-0.10 |   25.7     25.4 |   38.9     38.9 |     1.68   1.82+-0.14
+  usable_frac      20% |     1.16   1.32+-0.13 |   28.6     25.1 |   44.0     38.3 |     1.15   1.73+-0.25
+  usable_frac      30% |     1.10   1.31+-0.18 |   27.7     25.2 |   46.4     39.8 |     1.08   1.67+-0.26
+  bp_energy        10% |     1.27   1.31+-0.10 |   25.4     25.4 |   39.3     38.9 |     1.68   1.82+-0.14
+  bp_energy        20% |     1.32   1.32+-0.13 |   24.9     25.1 |   41.0     38.3 |     1.13   1.73+-0.25
+  bp_energy        30% |     1.07   1.31+-0.18 |   30.6     25.2 |   50.9     39.8 |     1.08   1.67+-0.26
+  fg_frac          10% |     1.32   1.31+-0.10 |   25.2     25.4 |   39.8     38.9 |     1.68   1.82+-0.14
+  fg_frac          20% |     1.29   1.32+-0.13 |   25.0     25.1 |   42.8     38.3 |     1.13   1.73+-0.25
+  fg_frac          30% |     1.01   1.31+-0.18 |   31.3     25.2 |   57.3     39.8 |     1.10   1.67+-0.26
+  composite        10% |     1.17   1.31+-0.10 |   28.1     25.4 |   43.0     38.9 |     1.84   1.82+-0.14
+  composite        20% |     1.16   1.32+-0.13 |   27.7     25.1 |   40.3     38.3 |     1.12   1.73+-0.25
+  composite        30% |     1.11   1.31+-0.18 |   28.8     25.2 |   42.5     39.8 |     1.09   1.67+-0.26
+  ORACLE(cheat)    10% |     1.11   1.31+-0.10 |   28.7     25.4 |   51.2     38.9 |     1.51   1.82+-0.14
+  ORACLE(cheat)    20% |     0.82   1.32+-0.13 |   32.7     25.1 |   73.0     38.3 |     1.31   1.73+-0.25
+  ORACLE(cheat)    30% |     0.57   1.31+-0.18 |   37.0     25.2 |   87.0     39.8 |     1.21   1.67+-0.26
+
+  --------------------------------------------------------------------------
+  MODE ENROL+VERIFY   (bad probes re-prompted; probe sets shrink)
+  gate metric     drop |           A d-prime |          A EER% |       A FAR@10% |           B d-prime
+                       |    gated     random |  gated     rand |  gated     rand |    gated     random
+  ridge_band       10% |     1.38   1.30+-0.14 |   22.3     24.9 |   33.6     39.3 |     1.77   1.80+-0.22
+  ridge_band       20% |     1.31   1.42+-0.25 |   22.6     23.2 |   35.2     34.6 |     1.49   1.76+-0.37
+  ridge_band       30% |     1.34   1.38+-0.36 |   22.3     23.8 |   30.8     33.6 |     1.64   1.69+-0.54
+  aniso_w          10% |     1.42   1.30+-0.14 |   21.7     24.9 |   33.3     39.3 |     1.77   1.80+-0.22
+  aniso_w          20% |     1.38   1.42+-0.25 |   21.8     23.2 |   34.6     34.6 |     1.53   1.76+-0.37
+  aniso_w          30% |     1.32   1.38+-0.36 |   22.0     23.8 |   34.8     33.6 |     1.81   1.69+-0.54
+  coh_w            10% |     1.42   1.30+-0.14 |   21.7     24.9 |   33.3     39.3 |     1.77   1.80+-0.22
+  coh_w            20% |     1.32   1.42+-0.25 |   21.5     23.2 |   32.9     34.6 |     1.50   1.76+-0.37
+  coh_w            30% |     1.40   1.38+-0.36 |   20.5     23.8 |   29.9     33.6 |     0.92   1.69+-0.54
+  usable_frac      10% |     1.22   1.30+-0.14 |   25.3     24.9 |   42.6     39.3 |     1.59   1.80+-0.22
+  usable_frac      20% |     1.26   1.42+-0.25 |   23.8     23.2 |   40.2     34.6 |     1.20   1.76+-0.37
+  usable_frac      30% |     1.18   1.38+-0.36 |   24.5     23.8 |   38.5     33.6 |     1.10   1.69+-0.54
+  bp_energy        10% |     1.18   1.30+-0.14 |   26.2     24.9 |   44.7     39.3 |     1.61   1.80+-0.22
+  bp_energy        20% |     1.09   1.42+-0.25 |   26.3     23.2 |   47.6     34.6 |     1.12   1.76+-0.37
+  bp_energy        30% |     0.96   1.38+-0.36 |   27.2     23.8 |   48.9     33.6 |     1.08   1.69+-0.54
+  fg_frac          10% |     1.17   1.30+-0.14 |   26.3     24.9 |   44.9     39.3 |     1.61   1.80+-0.22
+  fg_frac          20% |     1.02   1.42+-0.25 |   27.1     23.2 |   51.3     34.6 |     1.13   1.76+-0.37
+  fg_frac          30% |     1.11   1.38+-0.36 |   25.1     23.8 |   42.3     33.6 |     1.25   1.69+-0.54
+  composite        10% |     1.42   1.30+-0.14 |   21.7     24.9 |   33.3     39.3 |     1.77   1.80+-0.22
+  composite        20% |     1.27   1.42+-0.25 |   22.9     23.2 |   37.4     34.6 |     1.03   1.76+-0.37
+  composite        30% |     1.39   1.38+-0.36 |   22.0     23.8 |   32.1     33.6 |     1.67   1.69+-0.54
+  ORACLE(cheat)    10% |     1.43   1.30+-0.14 |   22.2     24.9 |   33.7     39.3 |     1.86   1.80+-0.22
+  ORACLE(cheat)    20% |     1.42   1.42+-0.25 |   22.1     23.2 |   33.4     34.6 |     1.95   1.76+-0.37
+  ORACLE(cheat)    30% |     1.71   1.38+-0.36 |   17.0     23.8 |   20.3     33.6 |     1.80   1.69+-0.54
+
+==============================================================================
+4. HOW MUCH AREA DO TWO PRESSES ACTUALLY SHARE?
+==============================================================================
+  Measured at the alignment the baseline matcher actually chose
+  (LCN+NCC, search +-20 px in x, +-8 in y, +-12 deg).
+
+  GENUINE pairs  (n=930 ordered pairs)
+    geometric overlap px     p5= 5850.0  p25= 6129.2  p50= 6512.0  p75= 6812.0  p95= 7400.0   median 83% of frame
+    BOTH-finger overlap px   p5= 2343.9  p25= 3625.0  p50= 4497.0  p75= 5267.0  p95= 6146.6   median 58% of frame
+    shared / smaller finger  p5=    0.6  p25=    0.7  p50=    0.8  p75=    0.8  p95=    0.9
+    |dx| chosen              p5=    1.0  p25=    7.0  p50=   12.0  p75=   17.0  p95=   20.0
+    |dy| chosen              p5=    0.0  p25=    3.0  p50=    5.0  p75=    8.0  p95=    8.0
+    |rotation| chosen (deg)  p5=    0.0  p25=    4.0  p50=    8.0  p75=   12.0  p95=   12.0
+    alignment pinned to the search-window EDGE: 35%
+
+  IMPOSTOR pairs  (n=434 ordered pairs)
+    geometric overlap px     p5= 5808.0  p25= 6165.0  p50= 6517.0  p75= 6896.2  p95= 7395.0   median 84% of frame
+    BOTH-finger overlap px   p5= 1853.2  p25= 2850.0  p50= 3787.5  p75= 4440.2  p95= 5294.8   median 49% of frame
+    shared / smaller finger  p5=    0.5  p25=    0.7  p50=    0.7  p75=    0.8  p95=    0.9
+    |dx| chosen              p5=    1.0  p25=    6.0  p50=   12.0  p75=   17.0  p95=   20.0
+    |dy| chosen              p5=    0.0  p25=    2.0  p50=    5.0  p75=    7.0  p95=    8.0
+    |rotation| chosen (deg)  p5=    0.0  p25=    4.0  p50=    8.0  p75=   11.0  p95=   12.0
+    alignment pinned to the search-window EDGE: 33%
+
+  rho(shared finger area, LCN+NCC score) over genuine pairs = +0.225 (p=0.0005)
+  median shared-finger area: genuine 4497 px vs impostor 3788 px
+  -> overlap area by itself does NOT separate genuine from impostor.
+
+  best impostor pair score = 0.447
+  genuine pairs above it: 2/930 (0%)
+  their median shared-finger area 3685 px vs 4500 px for the rest
+
+==============================================================================
+5. VARIANCE DECOMPOSITION OF THE GENUINE SCORE MATRIX
+==============================================================================
+  Fit  s_ij = mu + a_i + a_j + e_ij  over genuine pairs.
+  a_i is image i's intrinsic matchability -- the ONLY thing a
+  per-image capture-quality gate can ever influence.
+
+  n genuine pairs 465, mean score 0.1834
+  total variance                             0.006568
+  residual after per-image effects           0.004236
+  -> PER-IMAGE  (a gate could attack this):   35.5%
+  -> PAIR-SPECIFIC placement interaction  :   64.5%
+  per-image effect a_i: sd=0.0347, range -0.0744..+0.0464
+
+  how well can measurable quality predict a_i?
+    aniso_fg         rho=+0.411  p=0.0214
+    aniso_w          rho=+0.520  p=0.0034
+    blk_energy_med   rho=+0.407  p=0.0230
+    bp_energy        rho=+0.444  p=0.0148
+    coh_w            rho=+0.341  p=0.0630
+    ridge_band       rho=+0.599  p=0.0006
+    usable_frac      rho=+0.480  p=0.0048
+    composite        rho=+0.556  p=0.0020
+
+  CEILING ON ANY PER-IMAGE GATE:
+    best metric ridge_band explains rho^2 = 36% of a_i,
+    and a_i is only 36% of the genuine-score variance,
+    so a perfect gate on it touches 12.7% of the variance.
+
+==============================================================================
+6. ENROLMENT SELECTION: QUALITY vs DIVERSITY vs RANDOM
+==============================================================================
+  All three only ever look at the enrolment pool, never at a probe,
+  so all three are implementable on device.
+
+  PROTOCOL A -- pooled 31 genuine split at random into an enrol POOL
+  of 19 and 12 probes, 300 splits; k templates chosen from the pool.
+    k |         random |        quality |        diverse |    all-19
+    3 |   0.80+-0.35 |   0.65+-0.29 |   0.78+-0.30 |      1.41
+    5 |   0.99+-0.37 |   0.73+-0.29 |   0.87+-0.33 |      1.39
+    7 |   1.12+-0.36 |   0.82+-0.30 |   0.99+-0.32 |      1.42
+    9 |   1.16+-0.38 |   0.88+-0.34 |   1.11+-0.32 |      1.38
+   11 |   1.24+-0.38 |   1.02+-0.37 |   1.23+-0.34 |      1.40
+   13 |   1.29+-0.35 |   1.25+-0.36 |   1.28+-0.31 |      1.40
+   15 |   1.32+-0.36 |   1.33+-0.35 |   1.33+-0.34 |      1.39
+   17 |   1.35+-0.35 |   1.37+-0.35 |   1.35+-0.34 |      1.38
+   19 |   1.38+-0.31 |   1.38+-0.31 |   1.38+-0.31 |      1.38
+
+  PROTOCOL B -- enrol pool = 19 right-index-cover, probe = 12 right-index
+    k |         random |        quality |        diverse
+    3 |   0.83+-0.34 |   0.61       |   0.85      
+    5 |   1.03+-0.37 |   0.68       |   1.07      
+    7 |   1.23+-0.36 |   0.75       |   1.22      
+    9 |   1.37+-0.35 |   0.87       |   1.25      
+   11 |   1.52+-0.31 |   0.93       |   1.62      
+   13 |   1.66+-0.29 |   1.09       |   1.60      
+   15 |   1.69+-0.22 |   1.12       |   1.63      
+   17 |   1.82+-0.18 |   1.84       |   1.88      
+   19 |   1.84+-0.00 |   1.84       |   1.84      
+
+==============================================================================
+7. HEADLINE -- both protocols, same matcher (LCN + rotation + NCC),
+   only the ENROLMENT SELECTION / QUALITY GATE differs.
+==============================================================================
+
+  SCENARIO A -- POOLED. 500 random enrol-pool(19)/probe(12) splits
+  of the 31 genuine captures; impostors = all 14 right-middle.
+  configuration                       d-prime          EER %     FAR@10%FRR %
+  baseline: all 19 templates     1.37+-0.33     23.4+- 7.1      34.8+-13.4
+  random 15 of 19                1.30+-0.34     25.2+- 7.0      38.2+-14.9
+  top-15 by capture quality      1.31+-0.36     24.7+- 7.5      37.3+-15.5
+  15 most DIVERSE of 19          1.31+-0.33     23.9+- 6.8      35.7+-14.3
+  11 most DIVERSE of 19          1.21+-0.35     24.5+- 6.8      37.5+-14.3
+  9 most DIVERSE of 19           1.10+-0.34     26.5+- 5.8      39.6+-13.9
+
+  paired against the baseline on the SAME splits (mean diff, bootstrap p):
+    random 15 of 19              dd'=-0.075 (p=0.0005)   dEER=+1.84pp (p=0.0000)
+    top-15 by capture quality    dd'=-0.063 (p=0.0000)   dEER=+1.28pp (p=0.0000)
+    15 most DIVERSE of 19        dd'=-0.066 (p=0.0000)   dEER=+0.50pp (p=0.0005)
+    11 most DIVERSE of 19        dd'=-0.163 (p=0.0000)   dEER=+1.12pp (p=0.0000)
+    9 most DIVERSE of 19         dd'=-0.270 (p=0.0000)   dEER=+3.05pp (p=0.0000)
+
+  SCENARIO B -- REALISTIC. enrol = right-index-cover (19),
+  probe = right-index (12), impostor = right-middle (14).
+  [95% bootstrap CI resampling the probe sets]
+  configuration                         d-prime (CI)            EER % (CI)       FAR@10%FRR % (CI)
+  baseline: all 19 templates    1.84 [ 1.02, 3.56]   15.5 [ 0.0, 34.5]     14.3 [ 0.0, 35.7]
+  random 15 of 19               1.51 [ 0.75, 3.18]   15.5 [ 0.0, 34.5]     14.3 [ 0.0, 50.0]
+  top-15 by capture quality     1.12 [ 0.32, 2.53]   15.5 [ 4.2, 42.3]     42.9 [ 0.0,100.0]
+  15 most DIVERSE of 19         1.63 [ 0.75, 3.40]   15.5 [ 0.0, 34.5]     14.3 [ 0.0, 50.0]
+  11 most DIVERSE of 19         1.62 [ 0.75, 3.36]   15.5 [ 0.0, 34.5]     14.3 [ 0.0, 50.0]
+  9 most DIVERSE of 19          1.25 [ 0.42, 3.14]   23.2 [ 3.6, 38.7]     28.6 [ 0.0, 50.0]
+
+  NOTE: 12 genuine probes quantises EER in 8.3% steps and 14
+  impostors quantise FAR in 7.1% steps. Scenario B cannot resolve
+  d' differences below ~1.0; scenario A is the number to trust.

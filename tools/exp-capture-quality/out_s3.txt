@@ -1,0 +1,45 @@
+==============================================================================
+10. POSITIVE CONTROL FOR THE TRANSITIVITY TEST
+==============================================================================
+   Three synthetic 'captures' made by shifting ONE real capture by
+   known amounts. If the test is sound, closure error must be ~0.
+   synthetic triples n=10: |closure| med 0.0 px, max 10.0 px, exact: 70%
+   -> the test is sound; a real registration composes exactly.
+
+==============================================================================
+11. TRANSITIVITY ON THE STRONGEST GENUINE TRIPLES
+==============================================================================
+   triple selection                            n  med |closure|    <=4px
+   all genuine triples                      4495           24.0     3.1%
+   min pair score >= 0.20                    495           24.0     4.4%
+   min pair score >= 0.25                     88           25.5     2.3%
+   min pair score >= 0.30                     19           23.0     5.3%
+   shuffled null                           20000           24.0     2.8%
+
+==============================================================================
+12. REGISTRATION FROM THE BLOCK ORIENTATION FIELD
+==============================================================================
+   Ridge phase aliases (ridges repeat every ~8 px, so a wrong
+   alignment can correlate as well as the right one). The
+   orientation field varies far more slowly, so if ANY reliable
+   registration exists it should show up here.
+   field 13x37 blocks of 4px, search +-15 x +-4 blocks, min 120 blocks overlap
+   genuine  triples n= 4000: med |closure|  12.0 blocks (  48 px), exact(0):  0.3%, <=1 block:  1.8%
+   impostor triples n=  364: med |closure|  14.0 blocks (  56 px), exact(0):  0.0%, <=1 block:  0.3%
+   shuffled null       : med |closure|  18.0 blocks, exact(0):  0.1%, <=1 block:  0.5%
+
+   as a matcher in its own right, pairwise: genuine 0.286+-0.324  impostor 0.198+-0.318  d'=0.27
+
+==============================================================================
+13. OVERLAP, FROM THE ALIGNMENT THAT ACTUALLY COMPOSES
+==============================================================================
+   Global least-squares placement: solve for a per-image offset t_i
+   minimising sum w_ij ||(t_i - t_j) - d_ij||^2 over genuine pairs.
+   [LCN+NCC pairwise shifts   ] residual med  14.7 px, p90  24.6 px (fitted spread of placements: x sd 3.7 px, y sd 1.8 px)
+   [orientation-field shifts  ] residual med  28.4 px, p90  85.6 px (fitted spread of placements: x sd 38.3 px, y sd 10.7 px)
+
+   Direct overlap using the orientation-field alignment:
+     genuine  n= 465  shared finger / smaller finger: p5=0.37 p25=0.46 MED=0.54 p75=0.60 p95=0.77
+              geometric frame overlap median 54% of the 150x52 window
+     impostor n= 434  shared finger / smaller finger: p5=0.21 p25=0.39 MED=0.50 p75=0.59 p95=0.76
+              geometric frame overlap median 52% of the 150x52 window

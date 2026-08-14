@@ -1,0 +1,42 @@
+==============================================================================
+11a. BASELINE, stated three ways (no gate, no selection, all templates)
+==============================================================================
+  A, leave-one-out, 30 templates : d'= 1.47  EER= 15.2%  FAR@10%FRR= 35.7%
+  A, 2000 random 19/12 splits    : d'= 1.39+-0.33  EER= 23.0%  FAR@10%FRR= 34.6%
+  B, enrol 19 cover / probe 12   : d'= 1.84       EER= 15.5%  FAR@10%FRR= 14.3%
+
+==============================================================================
+11b. THE BEST-LOOKING GATE vs ITS RANDOM-DROP CONTROL, properly tested
+==============================================================================
+  composite quality, drop the worst 10%, ENROL+VERIFY. Control drops the
+  same number of images at random, WITHIN class, 2000 draws. If the gate
+  carries information, its d' must sit in the upper tail of the control.
+
+  drop 10%  (kept 28/31 genuine, 13/14 impostor)
+    A  gated d'= 1.40   random-drop control  1.33+-0.14   one-sided p=0.213
+       gated EER= 22.1%  control  24.4%   gated FAR@10= 35.6%  control  38.1%
+    B  gated d'= 1.77   random-drop control  1.82+-0.25   one-sided p=0.494
+       gated EER= 16.8%  control  15.5%   gated FAR@10= 15.4%  control  14.6%
+
+  drop 20%  (kept 25/31 genuine, 11/14 impostor)
+    A  gated d'= 1.27   random-drop control  1.35+-0.26   one-sided p=0.543
+       gated EER= 22.2%  control  24.3%   gated FAR@10= 37.0%  control  36.7%
+    B  gated d'= 1.03   random-drop control  1.78+-0.43   one-sided p=0.984
+       gated EER= 19.1%  control  15.3%   gated FAR@10= 27.3%  control  16.9%
+
+  drop 30%  (kept 22/31 genuine, 10/14 impostor)
+    A  gated d'= 1.38   random-drop control  1.42+-0.35   one-sided p=0.467
+       gated EER= 21.6%  control  23.5%   gated FAR@10= 30.6%  control  33.6%
+    B  gated d'= 1.67   random-drop control  1.71+-0.53   one-sided p=0.470
+       gated EER= 22.5%  control  17.6%   gated FAR@10= 20.0%  control  20.7%
+
+==============================================================================
+11c. BEST HONEST CONFIGURATION FOUND BY THIS INVESTIGATION
+==============================================================================
+  It is the UNMODIFIED baseline. No quality gate, no enrolment selection,
+  no score normalisation and no wider search window beat it on scenario A,
+  which is the only protocol here with enough probes to resolve a
+  difference.
+
+  A  d'=1.39  EER=23.0%  FAR@10%FRR=34.6%
+  B  d'=1.84  EER=15.5%  FAR@10%FRR=14.3%

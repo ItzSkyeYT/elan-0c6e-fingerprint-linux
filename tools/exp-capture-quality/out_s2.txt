@@ -1,0 +1,59 @@
+==============================================================================
+6. ARE THE MEASURED ALIGNMENTS REAL? (transitivity of registration)
+==============================================================================
+   For a triple i,j,k the shifts must compose: d(i,j)+d(j,k)=d(i,k).
+   Random/meaningless alignments do not compose. Impostor triples,
+   which cannot have a true registration, are the null distribution.
+   [matcher window +-20/+-8 ] genuine  n= 4000  |closure error| med  23.0 px  (shuffled null  24.0)  exact-ish (<=4px):  3.1% (null  2.1%)
+   [matcher window +-20/+-8 ] impostor n=  364  |closure error| med  24.0 px  (shuffled null  23.0)  exact-ish (<=4px):  2.7% (null  2.7%)
+   [wide +-60/+-20 strict   ] genuine  n= 4000  |closure error| med  53.0 px  (shuffled null  58.0)  exact-ish (<=4px):  0.8% (null  0.5%)
+   [wide +-60/+-20 strict   ] impostor n=  364  |closure error| med  54.0 px  (shuffled null  55.0)  exact-ish (<=4px):  0.8% (null  0.0%)
+
+==============================================================================
+7. IS A LOW-QUALITY CAPTURE A BAD TEMPLATE?
+==============================================================================
+   For every genuine probe, which enrolled capture wins the max?
+   'win rate' = fraction of the other 30 genuine probes for which
+   this image is the single best template.
+   rho(composite quality, template win rate) = +0.360  p=0.0460
+   rho(composite quality, own mean genuine score) = +0.566
+
+   rank image                           quality  win rate  mean score
+      1 -index-cover/_0004.pgm            0.710      0.13       0.196
+      2 right-index/_0010.pgm             0.500      0.10       0.130
+      3 right-index/_0007.pgm             0.852      0.06       0.215
+      4 right-index/_0003.pgm             0.500      0.06       0.143
+      5 right-index/_0011.pgm             0.852      0.06       0.222
+     27 -index-cover/_0012.pgm            0.267      0.00       0.190
+     28 -index-cover/_0013.pgm            0.509      0.00       0.140
+     29 -index-cover/_0015.pgm            0.222      0.00       0.167
+     30 -index-cover/_0014.pgm            0.062      0.00       0.147
+     31 -index-cover/_0018.pgm            0.438      0.00       0.159
+
+   bottom-third-quality genuine captures win the max for 6 of 31 probes (19%); they are 32% of the set.
+
+==============================================================================
+8. VERIFY-SIDE-ONLY GATE: does quality predict which PROBE fails?
+==============================================================================
+   All templates kept. Drop the worst N% of PROBES (genuine AND
+   impostor, so the impostor side is not quietly advantaged).
+   Control: drop the same number of probes at random, 500 draws.
+   B drop  10%  gated d'= 1.72 EER= 16.8% FAR@10= 15.4%   random d'= 1.85+-0.18  one-sided p=0.858
+   A drop  10%  gated d'= 1.49 EER= 21.2% FAR@10= 30.1%   random d'= 1.38+-0.13  one-sided p=0.149
+   B drop  20%  gated d'= 1.57 EER= 19.1% FAR@10= 18.2%   random d'= 1.89+-0.37  one-sided p=0.930
+   A drop  20%  gated d'= 1.38 EER= 21.7% FAR@10= 33.6%   random d'= 1.40+-0.26  one-sided p=0.438
+   B drop  30%  gated d'= 1.52 EER= 22.5% FAR@10= 20.0%   random d'= 1.97+-0.50  one-sided p=0.870
+   A drop  30%  gated d'= 1.48 EER= 21.4% FAR@10= 29.2%   random d'= 1.41+-0.27  one-sided p=0.368
+
+==============================================================================
+9. RE-PRESS CEILING: what if the device simply asked for MORE presses?
+==============================================================================
+   Score a genuine 'attempt' as the max over m independent probe
+   captures (the user presses up to m times, any accept wins). The
+   impostor gets the same m attempts, so FAR rises too. This is the
+   honest version of 'just retry', and it needs no quality metric.
+   m=1 attempts:  d'= 1.83  EER= 15.0%  FAR@10%FRR= 14.6%
+   m=2 attempts:  d'= 1.62  EER= 25.7%  FAR@10%FRR= 25.4%
+   m=3 attempts:  d'= 1.56  EER= 19.8%  FAR@10%FRR= 35.9%
+   (d' is roughly flat: retrying moves genuine and impostor
+    distributions together, so it buys convenience, not security.)

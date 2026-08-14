@@ -1,0 +1,54 @@
+==============================================================================
+16a. HOW MANY PRESSES SHOULD BE ENROLLED?
+==============================================================================
+
+   SCENARIO A (POOLED, strict leave-one-out): every one of the 31
+   genuine captures is a probe, scored against a random k-subset of
+   the OTHER 30. Impostors get an independent random k-subset.
+   200 repetitions.
+    k templates        d-prime          EER %     FAR@10%FRR %
+              1    0.46+-0.30     41.9+- 7.2       88.9+-10.0
+              2    0.63+-0.27     37.1+- 6.0       83.4+-14.7
+              3    0.73+-0.27     33.8+- 5.6       77.8+-18.2
+              5    0.90+-0.27     29.9+- 4.9       65.8+-17.5
+              8    1.06+-0.24     28.8+- 4.6       57.6+-16.5
+             10    1.12+-0.23     28.2+- 4.3       52.6+-14.8
+             12    1.18+-0.22     27.3+- 3.9       48.3+-14.2
+             15    1.28+-0.22     25.8+- 3.8       42.5+-11.7
+             19    1.33+-0.17     23.7+- 3.4       39.6+- 6.6
+             24    1.43+-0.14     20.7+- 3.6       38.5+- 4.3
+             30    1.49+-0.04     15.2+- 0.0       35.5+- 1.3
+
+   SCENARIO B (REALISTIC): templates = random k of the 19 cover
+   captures, probes fixed at 12 right-index + 14 right-middle.
+   200 random draws of the template subset.
+    k templates        d-prime          EER %     FAR@10%FRR %
+              1    0.38+-0.40     42.4+-13.3       85.8+- 9.6
+              2    0.66+-0.34     36.7+- 7.1       80.2+-14.1
+              3    0.84+-0.31     33.2+- 6.4       72.8+-16.6
+              5    1.03+-0.35     28.8+- 6.5       62.1+-20.0
+              8    1.34+-0.37     22.5+- 7.7       39.5+-19.7
+             10    1.45+-0.31     19.3+- 6.4       32.5+-17.1
+             12    1.56+-0.32     17.0+- 5.3       25.0+-15.1
+             15    1.69+-0.23     15.4+- 1.6       17.7+- 8.8
+             19    1.83+-0.00     15.5+- 0.0       14.3+- 0.0
+
+==============================================================================
+16b. IS A DELIBERATELY-VARIED ENROLMENT BETTER THAN A HABITUAL ONE?
+==============================================================================
+   Matched k=10, cross-set in both directions so no probe can be its
+   own template. 400 random template draws each.
+   enrol 10 of the 19 VARIED  -> probe the 12 habitual  d'= 1.44+-0.35  EER= 20.3%  FAR@10= 33.1%
+   enrol 10 of the 12 HABITUAL-> probe the 19 varied    d'= 1.48+-0.15  EER= 21.1%  FAR@10= 41.5%
+
+==============================================================================
+16c. BEST CONFIGURATION THIS INVESTIGATION FOUND, BOTH PROTOCOLS
+==============================================================================
+   A  enrol all 30 available (LOO), 400 reps:
+      d'=1.49+-0.04   EER=15.2%+-0.0   FAR@10%FRR=35.5%+-1.2
+   B  enrol all 19 cover, probe 12 index:
+      d'=1.83 [0.99,3.74]   EER=15.5% [0.0,34.5]   FAR@10%FRR=14.3% [0.0,35.7]
+
+   Both are the UNMODIFIED baseline matcher with the largest
+   available enrolment set. No quality gate, no capture selection,
+   no score normalisation improved on it.

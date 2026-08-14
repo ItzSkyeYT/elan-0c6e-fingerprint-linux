@@ -179,9 +179,13 @@ lever (see dead ends).
 ## The most promising approach: the `elanpress` driver
 
 An out-of-tree driver that treats `0c6e` as a **press** sensor and replaces
-minutiae matching entirely with **normalized cross-correlation** (threshold 0.55,
-±60 px x, ±20 px y, ±12° rotation tolerance). It registers as an `FpDevice`
-rather than an `FpImageDevice`, so NBIS/bozorth3 are bypassed.
+minutiae matching entirely with **cross-correlation**. It registers as an
+`FpDevice` rather than an `FpImageDevice`, so NBIS/bozorth3 are bypassed.
+
+> The upstream branch correlates **raw pixel intensities** (threshold 0.55,
+> ±60 px x, ±20 px y, ±12°), which is measurably worse than chance — see the
+> warning below. The local build in this repo replaces that scoring path; see
+> [What shipped: the LCN matcher](#what-shipped-the-lcn-matcher-august-2026).
 
 Use **[`Quoteme/libfprint` branch `elanpress`](https://github.com/Quoteme/libfprint/tree/elanpress)**
 (commit `9e6ea5a`) — *not* the original `filip-rs` HEAD. Quoteme's branch merges
@@ -297,6 +301,12 @@ If you have `04f3:0c6e`, please open a PR adding a row.
 
 ### ⚠️ `elanpress`'s matcher does not discriminate — do not use it for auth
 
+> **This section describes the *upstream* raw-intensity matcher.** It has since
+> been replaced in this repo's build — see
+> [What shipped: the LCN matcher](#what-shipped-the-lcn-matcher-august-2026).
+> The replacement is a real improvement and fixes the inversion described here,
+> but it is still not authentication-grade and still must not be wired to PAM.
+
 Measured on a GV301QH (firmware `0x0161`), presenting a **different finger**
 against an enrolled template:
 
@@ -405,6 +415,87 @@ more enrolment templates, deliberately covering the fingertip** — which is wha
 commercial small-area readers do. Until that is in place, treat `elanpress` as a
 **capture driver that proves the hardware works**, not as an authentication
 mechanism, and do not wire it to PAM.
+
+---
+
+## What shipped: the LCN matcher (August 2026)
+
+Findings 1 and 2 above are now implemented in the driver, in
+`libfprint-elanpress` commit **`85e7cd4`**, packaged as
+**`1.94.9.elanpress.lcn`**. The scoring path was replaced; capture, enrolment
+and the stored print format were not.
+
+**What changed.** Three things, in `elanpress-match.c`:
+
+1. **Local contrast normalisation** (separable Gaussian, σ = 6) of both images
+   before correlating. This is the fix for finding 1 — raw intensity on a press
+   sensor mostly encodes press force and contact area, and the old matcher was
+   ranking on that instead of on ridge structure, which is why it inverted.
+2. **Rotation search** ±12° in 4° steps, bilinear resampling.
+3. **A per-pixel validity mask** through the rotation, with the correlation
+   assembled from six weighted sums so out-of-frame pixels are *excluded*
+   rather than counted. The old code zero-filled the corners and correlated
+   them anyway; zero is an ordinary value in a normalised image, so those
+   corners dragged both means and — being in roughly the same place in both
+   images — contributed spurious agreement. Worth d′ 1.83 → 1.95 on its own.
+
+The decision threshold moves **0.55 → 0.30**. The score scale changed
+completely, so the old number carries no meaning here.
+
+**Existing enrolments stay valid.** The print blob format and version are
+unchanged, and scores are recomputed from the stored images at match time
+rather than persisted, so there is no mixed-scale hazard. No re-enrolment is
+needed for this upgrade. (Switching *drivers* still requires one — see above.)
+
+### Measured accuracy
+
+45-image labelled dataset, 8 templates enrolled (what `elanpress` enrols),
+scored the way the driver actually scores:
+
+| protocol | d′ | EER | FRR @ 0.30 | FAR @ 0.30 |
+|---|---|---|---|---|
+| shipped **before** this change (raw-intensity NCC) | **−0.72** | — | — | — |
+| pooled (random enrolment subsets) | 1.17 | 28.6% | 47.6% | **12.5%** |
+| realistic (enrol one session, probe a later one) | 2.15 | 15.5% | 0.0% | **14.3%** |
+
+The C implementation is cross-checked against the Python reference in
+`tools/matcher-lab.py` and `tools/exp-py-minutiae/wncc.py`: LCN planes agree to
+8.9e-16, masked NCC to 5.0e-10, end-to-end to 2.0e-08, and every image scores
+exactly 1.000000 against itself. The harness is `tools/ctest/` in the libfprint
+tree and compiles the driver's own source file, so what it measures is what the
+driver runs. Cost is ~25 ms per probe-vs-template pair, ~200 ms for an
+8-template verify.
+
+### ⚠️ This is still NOT authentication-grade. Do not wire it to PAM.
+
+The improvement is real, and the change removes a genuine security defect — the
+previous matcher was *worse than chance*, and a d′ of −0.72 means a wrong
+finger was systematically **favoured** over the enrolled one. But look at the
+FAR column: **at the shipped threshold roughly one impostor press in eight is
+accepted**, and because the driver takes the maximum over an 8-template set,
+more enrolled fingers means more chances to get in.
+
+An equal-error rate of 15–29% is orders of magnitude away from what a
+fingerprint reader is normally expected to deliver (commercial sensors target
+an FAR around 1 in 50,000). The ceiling here is not the algorithm — it is
+finding 4 above: a 150×52 window sees too small a patch of fingertip for two
+presses of the same finger to reliably overlap.
+
+Treat this as **a convenience unlock at best, and a demonstration that the
+hardware produces usable images at worst.** Specifically:
+
+- **Do not add it to `/etc/pam.d/system-auth`, `/etc/pam.d/sudo`, or any other
+  PAM stack.** See the PAM section above for how that goes wrong even when the
+  matcher works.
+- **Do not use it as a sole authentication factor** for anything you care
+  about — screen unlock on a machine holding secrets included.
+- A synthetic ridge-frequency grating scores *higher* than any genuine pair in
+  the dataset, so this is not presentation-attack resistant in any sense.
+
+The driver marks itself accordingly: `fprintd-list` and the GNOME Settings
+enrolment dialog show it as *"ElanTech press-type fingerprint sensor
+(experimental, not authentication-grade)"*, and it logs a warning to the
+journal once per `fprintd` activation.
 
 ---
 
