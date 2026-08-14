@@ -16,10 +16,20 @@
 #   elan-fp impostor   measure WRONG-finger scores — decides if tuning is safe
 #   elan-fp unwedge    run the recovery ladder on its own
 #   elan-fp collect L  capture a labelled dataset for offline matcher work
+#   elan-fp swipe      capture ONE swipe, dump the frames, judge the assembly
+#   elan-fp swipe-report D   re-judge an already-captured swipe directory
+#
+# `swipe` exits 0 if the assembled image passed every failure test, 2 if it
+# assembled but did not, 1 if nothing assembled, 3 if the swipe driver is not
+# installed.
 #   elan-fp doctor     full diagnostic dump for bug reports
 #
-# Flags:  --debug    keep driver logs (implies manual fprintd, needs root)
-#         -n N       iterations for `test` (default 10)
+# Flags:  --debug         keep driver logs (implies manual fprintd, needs root)
+#         -n N            iterations for `test` (default 10)
+#         --calibrate     `swipe`: run calibration instead of skipping it
+#         --max-frames N  `swipe`: override the 100-frame capture cap
+#         --no-partial    `swipe`: clear FPI_IMAGE_PARTIAL (keep perimeter
+#                         minutiae)
 #
 # https://github.com/ItzSkyeYT/elan-0c6e-fingerprint-linux
 
@@ -32,8 +42,10 @@ LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/elan-fp"
 VERIFY_TIMEOUT=40      # generous: user must physically touch the sensor
 ENROLL_TIMEOUT=180     # enrollment needs several touches
 SETTLE=2               # seconds to let the device re-enumerate
+SWIPE_TIMEOUT=75       # one swipe attempt: prompt, swipe, assemble, report
 
 DEBUG=0; ITERATIONS=10
+SWIPE_CALIBRATE=0; SWIPE_MAX_FRAMES=""; SWIPE_PARTIAL=1
 
 if [[ -t 1 ]]; then
   R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; DIM=$'\e[2m'; N=$'\e[0m'
@@ -72,6 +84,22 @@ find_device() {
 
 device_present() { find_device >/dev/null 2>&1; }
 
+# Does the installed libfprint contain this string?
+#
+# NOTE: -a is required. Plain `strings` only scans loadable initialised
+# sections and misses the GObject type name entirely.
+#
+# NOTE: grep -c, not grep -q. `set -o pipefail` is on, and grep -q exits as
+# soon as it matches, which kills `strings` with SIGPIPE and makes the whole
+# pipeline report failure — i.e. a successful match reads as "not found".
+# grep -c consumes all of the input, so there is no signal.
+so_has() {
+  local so=/usr/lib/libfprint-2.so.2 hit
+  [[ -r $so ]] || return 1
+  hit=$(strings -a "$so" 2>/dev/null | grep -c -- "$1")
+  (( hit > 0 ))
+}
+
 current_driver() {
   # Most authoritative: ask the running driver what it calls itself.
   # elan  -> "ElanTech Fingerprint Sensor"
@@ -86,10 +114,8 @@ current_driver() {
   fi
 
   # Fallback when nothing is enrolled: inspect the library.
-  # NOTE: -a is required. Plain `strings` only scans loadable initialised
-  # sections and misses the GObject type name entirely.
   local so=/usr/lib/libfprint-2.so.2
-  if [[ -r $so ]] && strings -a "$so" 2>/dev/null | grep -q FpiDeviceElanPress; then
+  if so_has FpiDeviceElanPress; then
     printf 'elanpress'
   elif [[ -r $so ]]; then
     printf 'elan'
@@ -475,7 +501,15 @@ do_enroll() {
   say
 
   local outfile="$LOGDIR/enroll.log"
-  step "Enrolling — press and hold, lift, repeat as prompted"
+  step "Enrolling"
+  say "  PRESS AND HOLD STILL. Land the finger, keep it completely still for a"
+  say "  second, then lift straight up. Do NOT slide."
+  say "  The driver now SELECTS the sharpest frame rather than averaging, so a"
+  say "  still finger gives it several shots at the same patch of skin. Sliding"
+  say "  makes each capture a different part of the finger, which is what made"
+  say "  earlier attempts fail to match."
+  say "  Between presses, shift slightly so the set covers the fingertip."
+  say
   local result
   result=$(run_fprintd "$ENROLL_TIMEOUT" "$outfile" fprintd-enroll "$FPUSER")
 
@@ -495,7 +529,8 @@ do_test() {
     return 3
   fi
 
-  say "Running $ITERATIONS verifications. Touch the sensor at each prompt."
+  say "Running $ITERATIONS verifications."
+  say "PRESS AND HOLD STILL at each prompt — same as enrolment, no sliding."
   say "This is the only meaningful gate: enrollment succeeding proves nothing."
   say
   for ((i = 1; i <= ITERATIONS; i++)); do
@@ -508,7 +543,24 @@ do_test() {
       hang)     printf '%shang%s\n'     "$R" "$N"; hang=$((hang + 1)) ;;
       *)        printf '%serror%s\n'    "$R" "$N"; fail=$((fail + 1)) ;;
     esac
-    (( hang >= 2 )) && { say; warn "two hangs — device wedged, stopping early"; break; }
+
+    # A wedge mid-run destroys the sample rather than the device. Recover and
+    # RETRY the same attempt, so a run always yields $ITERATIONS real verdicts;
+    # stopping early was costing more information than it saved.
+    if [[ $result == hang || $result == error ]]; then
+      printf '        recovering ... '
+      if usb_suspend_cycle >/dev/null 2>&1; then printf 'ok, retrying\n'
+      else kill_fprintd; printf 'partial, retrying\n'; fi
+      result=$(run_fprintd "$VERIFY_TIMEOUT" "$outfile" fprintd-verify "$FPUSER")
+      case $result in
+        match)    printf '  %2d/%d retry ... %smatch%s\n'    "$i" "$ITERATIONS" "$G" "$N"
+                  pass=$((pass + 1)); hang=$((hang > 0 ? hang - 1 : 0)) ;;
+        no-match) printf '  %2d/%d retry ... %sno-match%s\n' "$i" "$ITERATIONS" "$Y" "$N"
+                  fail=$((fail + 1)); hang=$((hang > 0 ? hang - 1 : 0)) ;;
+        *)        printf '  %2d/%d retry ... %sstill wedged%s\n' "$i" "$ITERATIONS" "$R" "$N" ;;
+      esac
+    fi
+    (( hang >= 4 )) && { say; warn "wedging repeatedly even after recovery — stopping"; break; }
   done
 
   say
@@ -642,6 +694,299 @@ do_collect() {
   return 0
 }
 
+# ----------------------------------------------------------------- swipe ----
+#
+# The 0c6e is a 150x52 strip: 7.5 x 2.6 mm at 508 dpi. 2.6 mm is far too short
+# to press a fingertip against, so the only geometry that can cover a finger is
+# a swipe, and no swipe capture from this sensor has ever been published. This
+# subcommand is the one-command test of that: it drives ONE capture through the
+# stock upstream "elan" swipe driver with the dump env vars set, then reports
+# what came back -- frame count, measured frame rate, the inter-frame
+# displacements the assembler estimated, the assembled dimensions, and the
+# analyze-swipe.py verdict.
+#
+# fprintd.service sets PrivateTmp=yes and ProtectHome=yes, so a daemon started
+# by D-Bus cannot write a dump anywhere we can read it. The daemon is therefore
+# started by hand, exactly as `score` and `collect` do.
+FPHOME=$(getent passwd "$FPUSER" 2>/dev/null | cut -d: -f6)
+FPHOME=${FPHOME:-$HOME}
+SWIPEDIR="${XDG_DATA_HOME:-$FPHOME/.local/share}/elan-fp/swipe"
+ANALYZE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/analyze-swipe.py"
+
+# The swipe driver is a different package from the press one and reports a
+# different name, so refuse early rather than dumping nothing and blaming the
+# sensor.
+swipe_driver_ok() {
+  local so=/usr/lib/libfprint-2.so.2
+  if [[ ! -r $so ]]; then
+    bad "no /usr/lib/libfprint-2.so.2"
+    return 1
+  fi
+  # Inspected with strings, not with fprintd-list: asking the daemon which
+  # driver is loaded makes it open the device, and this sensor only gives us
+  # about one working session per power-up. Do not spend it on a version check.
+  if so_has FpiDeviceElanPress; then
+    bad "the elanpress driver is installed; it averages frames into one"
+    bad "150x52 image instead of assembling them, so there is no swipe to see"
+    return 1
+  fi
+  if ! so_has FP_ELAN_DUMP_DIR; then
+    bad "the installed libfprint has no FP_ELAN_DUMP_DIR support"
+    note "this needs the swipe package, which is NOT installed by default:"
+    note "  cd /home/melb/projects/libfprint-elanswipe-pkg && makepkg -sf"
+    note "  sudo pacman -U libfprint-elanswipe-1.94.100.elanswipe-1-x86_64.pkg.tar.zst"
+    note "it REPLACES the system libfprint (conflicts with libfprint-elanpress)"
+    return 1
+  fi
+  return 0
+}
+
+# Enrolled prints, read off fprintd's storage rather than out of the daemon,
+# for the same reason: no device I/O. fprintd keys the store by driver id, so
+# prints enrolled under elanpress do not appear here.
+swipe_has_enrolled() {
+  as_root find "/var/lib/fprint/$FPUSER/elan" -type f 2>/dev/null | grep -q .
+}
+
+# Start fprintd by hand with the dump environment. $1 = dump dir.
+start_swipe_daemon() {
+  local dump="$1" env_str
+  mkdir -p "$LOGDIR" "$dump"
+  DBG_LOG="$LOGDIR/swipe-$(date +%Y%m%d-%H%M%S).log"
+
+  env_str="LC_ALL=C G_MESSAGES_DEBUG=all FP_ELAN_DUMP_DIR='$dump'"
+  # Default is to skip calibration on this PID: on fw 0x0161 it reports
+  # success and capture then fails anyway. --calibrate re-tests that.
+  if (( SWIPE_CALIBRATE )); then
+    env_str="$env_str FP_ELAN_SKIP_CALIBRATION=0"
+  else
+    env_str="$env_str FP_ELAN_SKIP_CALIBRATION=1"
+  fi
+  [[ -n $SWIPE_MAX_FRAMES ]] && env_str="$env_str FP_ELAN_MAX_FRAMES=$SWIPE_MAX_FRAMES"
+  (( SWIPE_PARTIAL )) || env_str="$env_str FP_ELAN_PARTIAL=0"
+
+  kill_fprintd
+  as_root sh -c "$env_str /usr/lib/fprintd -t > '$DBG_LOG' 2>&1 &"
+  sleep 2
+  if ! pgrep -x fprintd >/dev/null; then
+    bad "fprintd did not stay up — see $DBG_LOG"
+    return 1
+  fi
+  return 0
+}
+
+# Newest capture-* directory under $1 that has a finished capture.txt.
+swipe_latest_capture() {
+  local d last=""
+  for d in "$1"/capture-*/; do
+    [[ -d $d ]] || continue
+    last="${d%/}"
+  done
+  [[ -n $last ]] && printf '%s' "$last"
+}
+
+swipe_field() { sed -n "s/^$2 //p" "$1/capture.txt" 2>/dev/null | tail -1; }
+
+# One attempt. $1 = dump dir. Echoes nothing; return 0 if a capture directory
+# with at least one raw frame appeared.
+swipe_attempt() {
+  local dump="$1" op waited=0 cap=""
+  if swipe_has_enrolled; then
+    op=(fprintd-verify "$FPUSER")
+    note "a print is enrolled, using verify (one capture)"
+  else
+    op=(fprintd-enroll -f right-index "$FPUSER")
+    note "nothing enrolled for this driver, using enroll (it will ask for"
+    note "several swipes; one is enough, the tool stops as soon as it has one)"
+  fi
+
+  start_swipe_daemon "$dump" || return 1
+  trap 'stop_debug_daemon' EXIT
+
+  say
+  say "${Y}Swipe now.${N}  Put the pad of your finger on the power button and"
+  say "draw it along the button in one steady motion, about 1 second end to"
+  say "end, keeping contact the whole way. The strip is 2.6 mm across, so the"
+  say "motion is across the short axis."
+  say
+
+  timeout "$SWIPE_TIMEOUT" "${op[@]}" > "$LOGDIR/swipe-client.log" 2>&1 &
+  local client=$!
+
+  # Poll for a finished capture rather than waiting out the whole timeout:
+  # enroll would otherwise keep asking for four more swipes.
+  while (( waited < SWIPE_TIMEOUT )); do
+    sleep 1; waited=$((waited + 1))
+    cap=$(swipe_latest_capture "$dump")
+    if [[ -n $cap ]] && grep -qE '^(assembled_height|result) ' "$cap/capture.txt" 2>/dev/null; then
+      sleep 1   # let the last writes land
+      break
+    fi
+    kill -0 "$client" 2>/dev/null || break
+  done
+
+  # Kill the timeout wrapper AND the client it spawned: killing only the
+  # wrapper leaves fprintd-enroll holding the device open, and the next
+  # attempt then fails for a reason that has nothing to do with the sensor.
+  kill "$client" 2>/dev/null
+  pkill -x fprintd-enroll 2>/dev/null
+  pkill -x fprintd-verify 2>/dev/null
+  wait "$client" 2>/dev/null
+  stop_debug_daemon; trap - EXIT
+  as_root chown -R "$(id -u "$FPUSER"):$(id -g "$FPUSER")" "$dump" 2>/dev/null
+
+  cap=$(swipe_latest_capture "$dump")
+  [[ -n $cap ]] || return 1
+  (( $(find "$cap" -name 'raw_*.pgm' | wc -l) > 0 )) || return 1
+  return 0
+}
+
+# Everything the capture can tell us, separated into what was measured and
+# what it means. No claim is made about accuracy: there is no swipe data to
+# base one on and one capture could not support one anyway.
+swipe_report() {
+  local cap="$1" n_raw frames assembled_w assembled_h mean_dy mean_dx
+  local lim_dy lim_dx dropped elapsed fps verdict result
+
+  n_raw=$(find "$cap" -name 'raw_*.pgm' | wc -l)
+  frames=$(swipe_field "$cap" frames_captured)
+  dropped=$(swipe_field "$cap" frames_dropped)
+  assembled_w=$(swipe_field "$cap" assembled_width)
+  assembled_h=$(swipe_field "$cap" assembled_height)
+  mean_dy=$(swipe_field "$cap" mean_delta_y)
+  mean_dx=$(swipe_field "$cap" mean_abs_delta_x)
+  lim_dy=$(swipe_field "$cap" delta_y_at_limit)
+  lim_dx=$(swipe_field "$cap" delta_x_at_limit)
+  elapsed=$(swipe_field "$cap" elapsed_ms)
+  result=$(swipe_field "$cap" result)
+
+  # Measured frame rate, from the per-frame timestamps. This was previously
+  # only inferred from USB full-speed bulk arithmetic (~16-20 ms/frame).
+  fps=$(LC_ALL=C awk 'NR==1{f=$2} {l=$2; n++} END{
+          if (n > 1 && l > f) printf "%.1f fps (%.1f ms/frame)", (n-1)/((l-f)/1000), (l-f)/(n-1);
+          else printf "n/a"}' "$cap/timings.txt" 2>/dev/null)
+
+  say
+  say "  ${B}capture${N}          $cap"
+  printf '  %-16s %s raw frames written, %s kept, %s dropped as dark\n' \
+    "frames" "$n_raw" "${frames:-?}" "${dropped:-0}"
+  printf '  %-16s %s\n' "frame rate" "${fps:-n/a}"
+
+  if [[ -z $assembled_h ]]; then
+    say
+    bad "no image was assembled (${result:-capture did not complete})"
+    note "raw frames are still in $cap — the sensor's side of this is intact"
+    note "and can be re-examined offline with analyze-pgm.py"
+    return 1
+  fi
+
+  printf '  %-16s mean delta_y %s px, mean |delta_x| %s px\n' \
+    "displacement" "${mean_dy:-?}" "${mean_dx:-?}"
+  printf '  %-16s delta_y %s, |delta_x| %s  (of %s pairs)\n' \
+    "at search limit" "${lim_dy:-?}" "${lim_dx:-?}" "$(( ${frames:-1} - 1 ))"
+  printf '  %-16s %s x %s px = %s\n' "assembled" "$assembled_w" "$assembled_h" \
+    "$(LC_ALL=C awk -v w="$assembled_w" -v h="$assembled_h" \
+        'BEGIN{printf "%.1f x %.1f mm at 508 dpi", w/20.0, h/20.0}')"
+  printf '  %-16s %s ms\n' "elapsed" "${elapsed:-?}"
+
+  # A press capture is one 150x52 frame = 15.6 mm2. Anything that did not grow
+  # substantially past that did not assemble, whatever the verdict says.
+  local press_h=52
+  if (( assembled_h <= press_h * 2 )); then
+    say
+    bad "the assembly is no taller than two frames — the frames did not"
+    bad "register against each other"
+  fi
+
+  if [[ ${lim_dy:-0} -gt 0 && ${frames:-0} -gt 2 ]] &&
+     (( lim_dy * 2 >= frames - 1 )); then
+    say
+    warn "over half the frames hit find_overlap's delta_y search limit:"
+    warn "the estimator fell off the end of its window rather than finding a"
+    warn "registration. A faster swipe cannot be tracked past 49 px/frame."
+  fi
+
+  if [[ ! -r $ANALYZE ]]; then
+    warn "analyze-swipe.py not found at $ANALYZE, skipping the verdict"
+    return 0
+  fi
+
+  say
+  step "analyze-swipe.py"
+  verdict=$(timeout 300 python3 "$ANALYZE" "$cap/assembled.pgm" \
+              --seams "$cap/deltas.txt" --json 2>"$LOGDIR/analyze.err" \
+            | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(d[0]["verdict"])
+except Exception as e:
+    print("analysis failed: %s" % e)' 2>/dev/null)
+
+  if [[ -z $verdict ]]; then
+    warn "analyze-swipe.py produced nothing — see $LOGDIR/analyze.err"
+    return 0
+  fi
+  local vrc=2
+  case ${verdict^^} in
+    USABLE*)      ok "$verdict"; vrc=0 ;;
+    NOISE*)       bad "$verdict" ;;
+    *)            warn "$verdict" ;;
+  esac
+  say
+  note "full report:  python3 $ANALYZE $cap/assembled.pgm --seams $cap/deltas.txt"
+  note "controls:     python3 $ANALYZE --selftest     (ground truth by construction)"
+  note "press ref:    python3 $ANALYZE --baseline     (45 real press captures)"
+  return $vrc
+}
+
+do_swipe() {
+  swipe_driver_ok || return 3
+  need_root
+
+  local out attempt cap rc=1
+  out="$SWIPEDIR/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$out"
+
+  say "Capturing ONE swipe through the stock upstream elan driver."
+  say "calibration: $( (( SWIPE_CALIBRATE )) && echo "ON (--calibrate)" || echo "skipped (default for this PID)")"
+  say "frame cap:   ${SWIPE_MAX_FRAMES:-100 (driver default for 0c6e)}"
+  say "dumping to:  $out"
+
+  # Same ladder as everywhere else: this sensor answers a persistent 0xaf
+  # after about one session per power-up, and only a suspend/resume clears it.
+  # Spend the recovery before the attempt, not after a wasted swipe.
+  for attempt in 1 2 3; do
+    say
+    step "Attempt $attempt/3"
+    case $attempt in
+      1) unwedge 1 ;;
+      2) unwedge 2 ;;
+      3) unwedge 3 ;;
+    esac
+
+    if swipe_attempt "$out"; then
+      # A capture happened. Whatever the verdict says, do not spend another
+      # session re-swiping: the ladder is for "nothing came back at all".
+      cap=$(swipe_latest_capture "$out")
+      swipe_report "$cap"; rc=$?
+      break
+    fi
+
+    bad "no frames came back from that attempt"
+    if (( attempt < 3 )); then
+      note "escalating the recovery ladder and retrying"
+    else
+      note "driver log: $DBG_LOG"
+      note "grep it for 'sensor busy', 'swipe too short', 'delta_x' and"
+      note "'assembled image' — those four say which stage failed"
+    fi
+  done
+
+  say
+  note "everything from this run is under $out"
+  return $rc
+}
+
 do_doctor() {
   mkdir -p "$LOGDIR"
   local out
@@ -679,17 +1024,25 @@ do_doctor() {
 # ------------------------------------------------------------------ main ----
 
 usage() {
-  sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the header block, whatever its length, rather than a fixed range:
+  # a fixed range silently truncates the moment a subcommand is added.
+  sed -n '3,/^[^#]/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
 CMD=""; LABEL=""
 while (( $# )); do
   case $1 in
-    status|verify|enroll|test|score|impostor|unwedge|doctor) CMD=$1 ;;
+    status|verify|enroll|test|score|impostor|unwedge|swipe|doctor) CMD=$1 ;;
     collect) CMD=collect; shift; LABEL="${1:-}" ;;
+    swipe-report) CMD=swipe-report; shift; LABEL="${1:-}" ;;
     --debug) DEBUG=1 ;;
     -n) shift; ITERATIONS=${1:-10} ;;
+    --calibrate) SWIPE_CALIBRATE=1 ;;
+    --no-partial) SWIPE_PARTIAL=0 ;;
+    --max-frames) shift; SWIPE_MAX_FRAMES="${1:-}"
+                  [[ $SWIPE_MAX_FRAMES =~ ^[0-9]+$ ]] || {
+                    bad "--max-frames needs a number"; exit 1; } ;;
     -h|--help) usage 0 ;;
     *) bad "unknown argument: $1"; usage 1 ;;
   esac
@@ -713,5 +1066,13 @@ case $CMD in
   impostor) do_impostor ;;
   unwedge) need_root; unwedge 3 ;;
   collect) need_root; do_collect "$LABEL" ;;
+  swipe)   do_swipe ;;
+  swipe-report)
+           if [[ -z $LABEL || ! -d $LABEL ]]; then
+             bad "usage: elan-fp swipe-report <capture dir>"
+             note "e.g. $SWIPEDIR/<timestamp>/capture-<timestamp>-001"
+             exit 1
+           fi
+           swipe_report "$LABEL" ;;
   doctor)  do_doctor ;;
 esac

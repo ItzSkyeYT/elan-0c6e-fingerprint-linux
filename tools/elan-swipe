@@ -1,0 +1,1095 @@
+#!/usr/bin/env python3
+# ruff: noqa: E501
+"""
+elan-swipe -- capture a SWIPE from an ELAN 04f3:0c6e and assemble it exactly
+the way upstream libfprint's "elan" driver would, without needing a rebuilt
+libfprint and without libfprint's ELAN_MAX_FRAMES=30 ceiling.
+
+    sudo ./elan-swipe                 # capture a swipe, dump everything, analyse
+    sudo ./elan-swipe capture -n 200  # capture up to 200 frames
+    ./elan-swipe assemble DIR         # re-assemble an existing dump, no device
+
+Why this exists
+---------------
+04f3:0c6e is 150 x 52 px at ~500 dpi = 7.6 mm x 2.6 mm. That is swipe geometry,
+not press geometry. Upstream libfprint declares FP_SCAN_TYPE_SWIPE for it
+(drivers/elan.c:1018) and reconstructs a tall image with
+fpi_do_movement_estimation + fpi_assemble_frames. Nobody has ever captured a
+swipe on this unit, so this tool captures the raw frame stream *and* runs a
+bit-faithful Python port of libfprint's assembler over it, so the two can be
+judged separately.
+
+Everything the analyser prints about the assembly is a faithful re-execution of
+libfprint 1.94.100 fpi-assembling.c. Nothing here claims a match accuracy;
+there is no matcher in this file at all.
+
+Device access is raw usbdevfs ioctls (ctypes) so the only dependencies are
+numpy and, optionally, Pillow. Requires root for /dev/bus/usb write access.
+"""
+
+import argparse
+import ctypes
+import errno
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+VID, PID = 0x04F3, 0x0C6E
+
+# ---------------------------------------------------------------------------
+# libfprint constants, quoted from the real source so drift is obvious
+# ---------------------------------------------------------------------------
+# libfprint/drivers/elan.h:53
+ELAN_MIN_FRAMES = 7
+# libfprint/drivers/elan.h:54
+ELAN_MAX_FRAMES = 30
+# libfprint/drivers/elan.h:57
+ELAN_MAX_FRAME_HEIGHT = 50
+# libfprint/drivers/elan.h:61
+ELAN_SKIP_LAST_FRAMES = 2
+# libfprint/drivers/elan.h:73-74
+ELAN_CMD_TIMEOUT = 10000
+ELAN_FINGER_TIMEOUT = 200
+# libfprint/drivers/elan.h:64-66
+EP_CMD_OUT = 0x01
+EP_CMD_IN = 0x83
+EP_IMG_IN = 0x82
+
+CMD_GET_SENSOR_DIM = b"\x00\x0c"   # elan.h:89
+CMD_GET_FW_VER = b"\x40\x19"       # elan.h:96
+CMD_GET_IMAGE = b"\x00\x09"        # elan.h:111
+CMD_GET_CALIB_STATUS = b"\x40\x23"  # elan.h:127
+CMD_GET_CALIB_MEAN = b"\x40\x24"   # elan.h:134
+CMD_LED_ON = b"\x40\x31"           # elan.h:141
+CMD_PRE_SCAN = b"\x40\x3f"         # elan.h:150
+CMD_STOP = b"\x00\x0b"             # elan.h:158
+
+DPI = 500.0
+PX_PER_MM = DPI / 25.4  # 19.685
+
+UINT32 = 0xFFFFFFFF
+INT_MAX = 2147483647
+
+# ---------------------------------------------------------------------------
+# terminal
+# ---------------------------------------------------------------------------
+_tty = sys.stdout.isatty()
+R = "\033[31m" if _tty else ""
+G = "\033[32m" if _tty else ""
+Y = "\033[33m" if _tty else ""
+B = "\033[34m" if _tty else ""
+D = "\033[2m" if _tty else ""
+BOLD = "\033[1m" if _tty else ""
+N = "\033[0m" if _tty else ""
+
+
+def step(m):
+    print(f"{B}==>{N} {m}", flush=True)
+
+
+def ok(m):
+    print(f"{G}  ✔{N} {m}", flush=True)
+
+
+def bad(m):
+    print(f"{R}  ✘{N} {m}", flush=True)
+
+
+def warn(m):
+    print(f"{Y}  !{N} {m}", flush=True)
+
+
+def note(m):
+    print(f"{D}    {m}{N}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# usbdevfs via ctypes.  ioctl numbers verified by compiling against
+# <linux/usbdevice_fs.h> on this machine (x86-64).
+# ---------------------------------------------------------------------------
+USBDEVFS_BULK = 0xC0185502
+USBDEVFS_CLAIMINTERFACE = 0x8004550F
+USBDEVFS_RELEASEINTERFACE = 0x80045510
+USBDEVFS_IOCTL = 0xC0105512
+USBDEVFS_DISCONNECT = 0x00005516
+USBDEVFS_CLEAR_HALT = 0x80045515
+
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
+_libc.ioctl.restype = ctypes.c_int
+
+
+class _BulkTransfer(ctypes.Structure):
+    _fields_ = [
+        ("ep", ctypes.c_uint),
+        ("len", ctypes.c_uint),
+        ("timeout", ctypes.c_uint),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+class _UsbDevFsIoctl(ctypes.Structure):
+    _fields_ = [
+        ("ifno", ctypes.c_int),
+        ("ioctl_code", ctypes.c_int),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+class UsbTimeout(Exception):
+    pass
+
+
+class UsbError(Exception):
+    pass
+
+
+def sysfs_device():
+    for d in Path("/sys/bus/usb/devices").iterdir():
+        try:
+            if int((d / "idVendor").read_text(), 16) != VID:
+                continue
+            if int((d / "idProduct").read_text(), 16) != PID:
+                continue
+        except (OSError, ValueError):
+            continue
+        return d
+    return None
+
+
+class Elan:
+    def __init__(self, sysdev):
+        self.sysdev = sysdev
+        busnum = int((sysdev / "busnum").read_text())
+        devnum = int((sysdev / "devnum").read_text())
+        self.node = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+        self.fd = None
+        self.claimed = False
+        self.fw_ver = None
+        self.frame_width = 0
+        self.frame_height = 0
+        self.raw_frame_height = 0
+
+    # -- plumbing ----------------------------------------------------------
+    def open(self):
+        self.fd = os.open(self.node, os.O_RDWR)
+        # Detach any kernel driver bound to interface 0 (usually none: the
+        # interface is vendor class 0xff and libfprint drives it from userspace).
+        di = _UsbDevFsIoctl(0, USBDEVFS_DISCONNECT, None)
+        _libc.ioctl(self.fd, USBDEVFS_IOCTL, ctypes.byref(di))
+        ifno = ctypes.c_uint(0)
+        if _libc.ioctl(self.fd, USBDEVFS_CLAIMINTERFACE, ctypes.byref(ifno)) < 0:
+            e = ctypes.get_errno()
+            raise UsbError(f"claim interface 0 failed: {os.strerror(e)} "
+                           f"(is fprintd still holding the device?)")
+        self.claimed = True
+
+    def close(self):
+        if self.fd is None:
+            return
+        if self.claimed:
+            ifno = ctypes.c_uint(0)
+            _libc.ioctl(self.fd, USBDEVFS_RELEASEINTERFACE, ctypes.byref(ifno))
+            self.claimed = False
+        os.close(self.fd)
+        self.fd = None
+
+    def _bulk(self, ep, buf, timeout_ms):
+        bt = _BulkTransfer(ep, len(buf), timeout_ms,
+                           ctypes.cast(buf, ctypes.c_void_p))
+        r = _libc.ioctl(self.fd, USBDEVFS_BULK, ctypes.byref(bt))
+        if r < 0:
+            e = ctypes.get_errno()
+            if e in (errno.ETIMEDOUT, errno.ETIME):
+                raise UsbTimeout(f"ep 0x{ep:02x} timed out after {timeout_ms} ms")
+            raise UsbError(f"bulk ep 0x{ep:02x}: {os.strerror(e)}")
+        return r
+
+    def write(self, cmd):
+        buf = ctypes.create_string_buffer(cmd, len(cmd))
+        self._bulk(EP_CMD_OUT, buf, ELAN_CMD_TIMEOUT)
+
+    def read(self, ep, length, timeout_ms):
+        buf = ctypes.create_string_buffer(length)
+        n = self._bulk(ep, buf, timeout_ms)
+        return bytes(buf.raw[:n])
+
+    def cmd(self, cmd, resp_len, ep=EP_CMD_IN, timeout_ms=ELAN_CMD_TIMEOUT):
+        """elan_run_cmd + elan_cmd_read: 2-byte OUT then an IN read.
+
+        The request length is rounded up to a multiple of the 64-byte max
+        packet size so an unexpectedly chatty device (ELAN_0C42 sends an extra
+        byte for 1-byte responses, elan.c:398-403) gives EOVERFLOW rather than
+        wedging the endpoint. A short packet still terminates the transfer, so
+        this never waits for bytes the device is not sending."""
+        self.write(cmd)
+        if resp_len == 0:
+            return b""
+        want = ((resp_len + 63) // 64) * 64
+        return self.read(ep, want, timeout_ms)
+
+    # -- driver-equivalent operations -------------------------------------
+    def activate(self):
+        """Port of activate_run_state, elan.c:832-891."""
+        r = self.cmd(CMD_GET_FW_VER, 2)                        # elan.c:842
+        self.fw_ver = (r[0] << 8) | r[1]                       # elan.c:846
+        r = self.cmd(CMD_GET_SENSOR_DIM, 4)                    # elan.c:853
+        self.dim_raw = list(r)
+        # elan.c:856-878, non-rotated branch (0c6e is not ELAN_NOT_ROTATED)
+        self.frame_width = r[2]
+        self.frame_height = self.raw_frame_height = r[0]
+        if self.frame_width % 2 == 1 and self.frame_height % 2 == 1:
+            self.frame_width += 1
+            self.frame_height += 1
+            self.raw_frame_height = self.frame_height
+        # elan.c:879-880 -- the crop that limits swipe stitching granularity.
+        self.frame_height_cropped = min(self.frame_height, ELAN_MAX_FRAME_HEIGHT)
+
+    @property
+    def raw_len(self):
+        """elan.c:407-408 -- raw_frame_height * frame_width * 2."""
+        return self.raw_frame_height * self.frame_width * 2
+
+    def get_image_raw(self, timeout_ms=ELAN_CMD_TIMEOUT):
+        return self.cmd(CMD_GET_IMAGE, self.raw_len, ep=EP_IMG_IN,
+                        timeout_ms=timeout_ms)
+
+    def pre_scan(self, timeout_ms):
+        return self.cmd(CMD_PRE_SCAN, 1, timeout_ms=timeout_ms)
+
+    def led_on(self):
+        self.write(CMD_LED_ON)   # response_len == ELAN_CMD_SKIP_READ
+
+    def stop(self):
+        try:
+            self.write(CMD_STOP)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# recovery ladder (mirrors tools/elan-fp, which documents these levels)
+# ---------------------------------------------------------------------------
+def kill_fprintd():
+    subprocess.run(["systemctl", "stop", "fprintd"],
+                   capture_output=True, check=False)
+    subprocess.run(["pkill", "-x", "fprintd"], capture_output=True, check=False)
+    time.sleep(1)
+
+
+def usb_suspend_cycle(sysdev):
+    """Level 2: selective suspend/resume. The only thing known to clear the
+    persistent-0xaf wedge on this unit; a USB reset does not."""
+    ctl = sysdev / "power" / "control"
+    delay = sysdev / "power" / "autosuspend_delay_ms"
+    try:
+        prev_ctl = ctl.read_text().strip()
+        prev_delay = delay.read_text().strip()
+    except OSError:
+        return False
+    try:
+        ctl.write_text("auto")
+        delay.write_text("500")
+        status = ""
+        for _ in range(6):
+            time.sleep(1)
+            status = (sysdev / "power" / "runtime_status").read_text().strip()
+            if status == "suspended":
+                break
+    finally:
+        try:
+            ctl.write_text(prev_ctl)
+            delay.write_text(prev_delay)
+        except OSError:
+            pass
+    time.sleep(2)
+    return status == "suspended"
+
+
+# ---------------------------------------------------------------------------
+# Faithful port of the libfprint frame pipeline
+# ---------------------------------------------------------------------------
+def elan_save_frame(raw_bytes, frame_width, frame_height, raw_frame_height,
+                    rotated=True):
+    """Port of elan_save_frame, elan.c:115-151.
+
+    frame[x + y*W] = LE16(raw[frame_margin + y + x*raw_height])   (rotated)
+    frame[x + y*W] = LE16(raw[x + (y+frame_margin)*W])            (not rotated)
+    """
+    margin = (raw_frame_height - frame_height) // 2
+    raw = np.frombuffer(raw_bytes, dtype="<u2")
+    if rotated:
+        # raw is (frame_width, raw_frame_height) in memory order
+        r = raw.reshape(frame_width, raw_frame_height)
+        return r[:, margin:margin + frame_height].T.copy()
+    r = raw.reshape(raw_frame_height, frame_width)
+    return r[margin:margin + frame_height, :].copy()
+
+
+def elan_save_img_frame(frame_u16, background_u16):
+    """Port of elan_save_img_frame, elan.c:200-231. Returns None if sum==0."""
+    out = np.where(background_u16 > frame_u16, 0,
+                   frame_u16.astype(np.int32) - background_u16.astype(np.int32))
+    out = out.astype(np.uint16)
+    if int(out.sum()) == 0:
+        return None
+    return out
+
+
+def process_frame_thirds(raw_frame):
+    """Port of elan_process_frame_thirds, elan.c:273-315 (the default for
+    ELAN_ALL_DEV / 0c6e)."""
+    n = raw_frame.size
+    flat = raw_frame.reshape(-1)
+    # C sorts *signed* shorts (cmp_short casts to short). Values here are
+    # background-subtracted 14-bit, so they stay non-negative; sorting as
+    # uint16 matches.
+    s = np.sort(flat)
+    lvl0 = int(s[0])
+    lvl1 = int(s[n * 3 // 10])
+    lvl2 = int(s[n * 65 // 100])
+    lvl3 = int(s[n - 1])
+    lvl1 = max(lvl1, lvl0 + 1)
+    lvl2 = max(lvl2, lvl1 + 1)
+    lvl3 = max(lvl3, lvl2 + 1)
+    px = flat.astype(np.int64)
+    out = np.empty(n, dtype=np.int64)
+    m0 = (px >= lvl0) & (px < lvl1)
+    m1 = (px >= lvl1) & (px < lvl2)
+    m2 = ~(m0 | m1)
+    out[m0] = (px[m0] - lvl0) * 99 // (lvl1 - lvl0)
+    out[m1] = 99 + (px[m1] - lvl1) * 56 // (lvl2 - lvl1)
+    out[m2] = 155 + (px[m2] - lvl2) * 100 // (lvl3 - lvl2)
+    return (out & 0xFF).astype(np.uint8).reshape(raw_frame.shape)
+
+
+def process_frame_linear(raw_frame):
+    """Port of elan_process_frame_linear, elan.c:233-271."""
+    mn = int(raw_frame.min())
+    mx = int(raw_frame.max())
+    if mx == mn:
+        return np.zeros(raw_frame.shape, dtype=np.uint8), True
+    px = raw_frame.astype(np.int64)
+    out = (px - mn) * 0xFF // (mx - mn)
+    return (out & 0xFF).astype(np.uint8), False
+
+
+# --- fpi-assembling.c ------------------------------------------------------
+def calc_error(f1, f2, dx, dy, exact=False):
+    """Port of calc_error, fpi-assembling.c:42-93.
+
+    `exact=False` reproduces the C unsigned-int arithmetic including the
+    32-bit wrap at line 89 (`err *= frame_height * frame_width`). For a
+    150x50 elan frame that multiply can genuinely overflow -- see
+    the OVERFLOW note in the report.
+    """
+    H, W = f1.shape
+    width = W - abs(dx)
+    height = H - dy
+    if height == 0 or width == 0:
+        return INT_MAX, False
+    x1 = 0 if dx < 0 else dx
+    x2 = -dx if dx < 0 else 0
+    a = f1[0:height, x1:x1 + width].astype(np.int32)
+    b = f2[dy:dy + height, x2:x2 + width].astype(np.int32)
+    err = int(np.abs(a - b).sum())
+    scaled = err * (H * W)
+    overflowed = scaled > UINT32
+    if not exact:
+        scaled &= UINT32
+    return scaled // (height * width), overflowed
+
+
+def find_overlap(f1, f2, dy_min=2, dx_range=8, exact=False):
+    """Port of find_overlap, fpi-assembling.c:98-130."""
+    H, W = f1.shape
+    min_error = 255 * H * W
+    dx_out = dy_out = 0
+    n_ovf = n_tot = 0
+    winner_ovf = False
+    for dy in range(dy_min, H):
+        for dx in range(-dx_range, dx_range):
+            err, ovf = calc_error(f1, f2, dx, dy, exact=exact)
+            n_tot += 1
+            n_ovf += ovf
+            if err < min_error:
+                min_error = err
+                dx_out = -dx          # NOTE the sign flip, fpi-assembling.c:124
+                dy_out = dy
+                winner_ovf = ovf
+    return dx_out, dy_out, min_error, (n_ovf, n_tot, winner_ovf)
+
+
+def do_movement_estimation(frames, reverse, dy_min=2, dx_range=8, exact=False):
+    """Port of do_movement_estimation, fpi-assembling.c:132-180."""
+    deltas = [(0, 0)] * len(frames)
+    total = 0
+    n_ovf = n_tot = n_win_ovf = 0
+    per_pair = []
+    for i in range(1, len(frames)):
+        prev, cur = frames[i - 1], frames[i]
+        if reverse:
+            dx, dy, err, o = find_overlap(prev, cur, dy_min, dx_range, exact)
+            dx, dy = -dx, -dy
+        else:
+            dx, dy, err, o = find_overlap(cur, prev, dy_min, dx_range, exact)
+        deltas[i] = (dx, dy)
+        per_pair.append((dx, dy, err))
+        total += err
+        n_ovf += o[0]
+        n_tot += o[1]
+        n_win_ovf += bool(o[2])
+    # num_frames starts at 1 and post-increments once per iteration
+    return deltas, total // len(frames), per_pair, (n_ovf, n_tot, n_win_ovf)
+
+
+def fpi_do_movement_estimation(frames, dy_min=2, dx_range=8, exact=False):
+    """Port of fpi_do_movement_estimation, fpi-assembling.c:194-205."""
+    fwd, err, fwd_pairs, ovf1 = do_movement_estimation(
+        frames, False, dy_min, dx_range, exact)
+    rev, rev_err, rev_pairs, ovf2 = do_movement_estimation(
+        frames, True, dy_min, dx_range, exact)
+    chose_forward = err < rev_err
+    deltas = fwd if chose_forward else rev
+    pairs = fwd_pairs if chose_forward else rev_pairs
+    o = ovf1 if chose_forward else ovf2
+    return deltas, {
+        "forward_error": err,
+        "reverse_error": rev_err,
+        "chose": "forward" if chose_forward else "reverse",
+        "pairs": pairs,
+        "ovf_candidates": o[0],
+        "ovf_total_candidates": o[1],
+        "ovf_winners": o[2],
+    }
+
+
+def fpi_assemble_frames(frames, deltas, image_width):
+    """Port of fpi_assemble_frames, fpi-assembling.c:255-313, including
+    aes_blit_stripe (fpi-assembling.c:207-243)."""
+    H, W = frames[0].shape
+    deltas = list(deltas)
+    deltas[0] = (0, 0)                      # fpi-assembling.c:270-272
+    height = sum(dy for _, dy in deltas)
+    reverse = height < 0
+    if reverse:
+        height = -height
+    height += H                             # fpi-assembling.c:289
+    img = np.zeros((height, image_width), dtype=np.uint8)
+    y = (height - H) if reverse else 0      # fpi-assembling.c:299
+    x = (image_width - W) // 2 if image_width >= W else -((W - image_width) // 2)
+    for frame, (dx, dy) in zip(frames, deltas):
+        y += dy
+        x += dx
+        ix1, fx1 = (0, -x) if x < 0 else (x, 0)
+        iy1, fy1 = (0, -y) if y < 0 else (y, 0)
+        fh = min(H - fy1, img.shape[0] - iy1)
+        fw = min(W - fx1, img.shape[1] - ix1)
+        if fh <= 0 or fw <= 0:
+            continue
+        img[iy1:iy1 + fh, ix1:ix1 + fw] = frame[fy1:fy1 + fh, fx1:fx1 + fw]
+    flags = ["COLORS_INVERTED"]
+    if not reverse:
+        flags += ["H_FLIPPED", "V_FLIPPED"]
+    return img, reverse, flags
+
+
+def normalise_like_nbis(img, flags):
+    """Apply the flags the way fp-image.c:309-316 does before get_minutiae:
+    hflip, then vflip, then invert."""
+    out = img
+    if "H_FLIPPED" in flags:
+        out = out[:, ::-1]
+    if "V_FLIPPED" in flags:
+        out = out[::-1, :]
+    if "COLORS_INVERTED" in flags:
+        out = 255 - out
+    return np.ascontiguousarray(out)
+
+
+# ---------------------------------------------------------------------------
+# file output
+# ---------------------------------------------------------------------------
+def write_pgm8(path, arr):
+    h, w = arr.shape
+    with open(path, "wb") as f:
+        f.write(b"P5\n%d %d\n255\n" % (w, h))
+        f.write(np.ascontiguousarray(arr, dtype=np.uint8).tobytes())
+
+
+def write_pgm16(path, arr, maxval=16383):
+    h, w = arr.shape
+    with open(path, "wb") as f:
+        f.write(b"P5\n%d %d\n%d\n" % (w, h, maxval))
+        f.write(np.ascontiguousarray(arr, dtype=">u2").tobytes())
+
+
+def maybe_png(path, arr):
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    Image.fromarray(np.ascontiguousarray(arr, dtype=np.uint8), "L").save(path)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# capture
+# ---------------------------------------------------------------------------
+def do_capture(args):
+    if os.geteuid() != 0:
+        bad("root required for raw USB access")
+        note(f"re-run: sudo {' '.join(sys.argv)}")
+        return 2
+
+    sysdev = sysfs_device()
+    if sysdev is None:
+        bad(f"no {VID:04x}:{PID:04x} on this machine")
+        return 1
+
+    step("Recovery level 1: releasing fprintd's claim on the device")
+    kill_fprintd()
+    ok("fprintd stopped")
+
+    if args.outdir:
+        outdir = Path(args.outdir)
+    else:
+        sudo_user = os.environ.get("SUDO_USER")
+        home = Path(f"/home/{sudo_user}") if sudo_user else Path.home()
+        outdir = (home / ".local/share/elan-fp/swipe"
+                  / time.strftime("%Y%m%d-%H%M%S"))
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    dev = Elan(sysdev)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            dev.open()
+            break
+        except UsbError as e:
+            if attempt >= 2:
+                bad(str(e))
+                return 1
+            warn(f"{e}; trying a suspend/resume cycle")
+            usb_suspend_cycle(sysdev)
+            sysdev = sysfs_device() or sysdev
+            dev = Elan(sysdev)
+
+    try:
+        step("Activating (get_fw_ver, get_sensor_dim)")
+        dev.activate()
+        ok(f"fw 0x{dev.fw_ver:04x}, sensor dim reply {dev.dim_raw}")
+        ok(f"frame_width={dev.frame_width}  raw_frame_height={dev.raw_frame_height}"
+           f"  frame_height(stock, ELAN_MAX_FRAME_HEIGHT-cropped)={dev.frame_height_cropped}")
+        note(f"raw USB frame = {dev.raw_len} bytes "
+             f"({dev.raw_frame_height}x{dev.frame_width} x 2 bytes)")
+        note(f"physical: {dev.frame_width / PX_PER_MM:.2f} mm x "
+             f"{dev.raw_frame_height / PX_PER_MM:.2f} mm at {DPI:.0f} dpi")
+
+        if args.calibrate:
+            step("Calibration handshake (opt-in, --calibrate)")
+            r = dev.cmd(CMD_GET_CALIB_MEAN, 2)
+            calib_mean = r[0] * 0xFF + r[1]     # elan.c:653-654, yes, *0xff
+            note(f"get_calib_mean -> 0x{r.hex()} = {calib_mean}")
+            r = dev.cmd(CMD_GET_CALIB_STATUS, 1)
+            note(f"get_calib_status -> 0x{r[0]:02x}")
+
+        step("Capturing background -- KEEP YOUR FINGER OFF THE SENSOR")
+        for i in range(args.settle, 0, -1):
+            print(f"\r    {i} ...  ", end="", flush=True)
+            time.sleep(1)
+        print("\r" + " " * 30 + "\r", end="")
+        bg_raw = dev.get_image_raw()
+        if len(bg_raw) != dev.raw_len:
+            warn(f"short background read: {len(bg_raw)}/{dev.raw_len} bytes")
+        (outdir / "background.raw").write_bytes(bg_raw)
+        # Background is saved at full raw height (elan_save_background ->
+        # elan_save_frame with frame_height == raw height at that point only
+        # if uncropped; the driver uses the cropped height, so do the same).
+        fh = dev.frame_height_cropped if not args.full_height else dev.raw_frame_height
+        bg = elan_save_frame(bg_raw, dev.frame_width, fh, dev.raw_frame_height)
+        ok(f"background captured, mean={bg.mean():.0f} "
+           f"min={bg.min()} max={bg.max()}")
+
+        step("LED on, waiting for the swipe")
+        dev.led_on()
+        print()
+        print(f"  {BOLD}SWIPE NOW.{N}")
+        print("  Place the pad of your finger at the *tip* end of the sensor and")
+        print("  draw it steadily across the SHORT axis of the strip, toward you,")
+        print(f"  over about 1 second. The strip is only "
+              f"{dev.raw_frame_height / PX_PER_MM:.1f} mm in that direction, so the")
+        print("  motion is the length of your fingertip, not the width of the sensor.")
+        print(f"  Waiting up to {args.wait / 1000:.0f} s for first contact...")
+        print()
+
+        frames_raw = []
+        stamps = []
+        prescan_log = []
+        t0 = None
+        timeout = args.wait
+        n_max = args.max_frames
+        stop_reason = "unknown"
+        af_retries = 0
+
+        while len(frames_raw) < n_max:
+            try:
+                r = dev.pre_scan(timeout)
+            except UsbTimeout:
+                if frames_raw:
+                    stop_reason = "finger lifted (pre_scan timeout)"
+                else:
+                    stop_reason = "no finger seen"
+                break
+            b = r[0] if r else -1
+            prescan_log.append(b)
+            if b == 0x55:
+                try:
+                    raw = dev.get_image_raw()
+                except UsbTimeout:
+                    stop_reason = "get_image timeout"
+                    break
+                if len(raw) != dev.raw_len:
+                    stop_reason = (f"short image read: {len(raw)}/{dev.raw_len} "
+                                   f"bytes on frame {len(frames_raw)}")
+                    break
+                t = time.monotonic()
+                if t0 is None:
+                    t0 = t
+                frames_raw.append(raw)
+                stamps.append(t - t0)
+                timeout = ELAN_FINGER_TIMEOUT   # elan.c:586
+                print(f"\r    frame {len(frames_raw):3d}   t={stamps[-1] * 1000:7.1f} ms",
+                      end="", flush=True)
+            elif b in (0x00, 0xAF):
+                af_retries += 1
+                if af_retries > 200:
+                    stop_reason = f"device wedged (persistent 0x{b:02x})"
+                    break
+                time.sleep(0.01)
+            else:
+                stop_reason = f"unexpected pre_scan response 0x{b:02x}"
+                break
+        else:
+            stop_reason = f"hit --max-frames ({n_max})"
+        print()
+
+        dev.stop()
+    finally:
+        dev.close()
+
+    step("Capture finished")
+    note(f"stop reason: {stop_reason}")
+    if not frames_raw:
+        bad("no frames captured")
+        if 0xAF in prescan_log:
+            note("saw 0xaf -- run `elan-fp unwedge` (or power-cycle) and retry")
+        return 1
+
+    ok(f"{len(frames_raw)} frames in {stamps[-1] * 1000:.0f} ms")
+    if len(stamps) > 1:
+        iv = np.diff(stamps) * 1000
+        ok(f"inter-frame interval: median {np.median(iv):.1f} ms, "
+           f"mean {iv.mean():.1f} ms, min {iv.min():.1f}, max {iv.max():.1f}")
+        ok(f"MEASURED frame rate: {1000 / np.median(iv):.1f} fps")
+
+    # ---- dump ----
+    rawdir = outdir / "raw"
+    rawdir.mkdir(exist_ok=True)
+    stack = np.stack([
+        np.frombuffer(b, dtype="<u2").reshape(dev.frame_width,
+                                              dev.raw_frame_height)
+        for b in frames_raw])
+    np.save(outdir / "raw_stream.npy", stack)
+    for i, b in enumerate(frames_raw):
+        (rawdir / f"frame_{i:04d}.bin").write_bytes(b)
+        f16 = elan_save_frame(b, dev.frame_width, dev.raw_frame_height,
+                              dev.raw_frame_height)
+        write_pgm16(rawdir / f"frame_{i:04d}.pgm", f16)
+
+    meta = {
+        "vid": VID, "pid": PID,
+        "fw_ver": dev.fw_ver,
+        "sensor_dim_reply": dev.dim_raw,
+        "frame_width": dev.frame_width,
+        "raw_frame_height": dev.raw_frame_height,
+        "frame_height_stock_cropped": dev.frame_height_cropped,
+        "raw_len_bytes": dev.raw_len,
+        "usb_speed_mbps": (sysdev / "speed").read_text().strip(),
+        "n_frames": len(frames_raw),
+        "timestamps_s": stamps,
+        "prescan_responses": prescan_log,
+        "stop_reason": stop_reason,
+        "calibration_run": bool(args.calibrate),
+        "dpi_assumed": DPI,
+        "libfprint_constants": {
+            "ELAN_MIN_FRAMES": ELAN_MIN_FRAMES,
+            "ELAN_MAX_FRAMES": ELAN_MAX_FRAMES,
+            "ELAN_MAX_FRAME_HEIGHT": ELAN_MAX_FRAME_HEIGHT,
+            "ELAN_SKIP_LAST_FRAMES": ELAN_SKIP_LAST_FRAMES,
+            "ELAN_FINGER_TIMEOUT": ELAN_FINGER_TIMEOUT,
+        },
+    }
+    (outdir / "meta.json").write_text(json.dumps(meta, indent=2))
+    ok(f"raw stream written to {outdir}")
+    note(f"  raw_stream.npy      {stack.shape} uint16, exactly as the device sent it")
+    note(f"  raw/frame_NNNN.pgm  {len(frames_raw)} x 16-bit PGM, {dev.frame_width}x{dev.raw_frame_height}")
+    note("  raw/frame_NNNN.bin  byte-for-byte USB payloads")
+    note("  background.raw      background frame used for subtraction")
+    print()
+
+    args.dir = str(outdir)
+    return do_assemble(args)
+
+
+# ---------------------------------------------------------------------------
+# assemble / analyse
+# ---------------------------------------------------------------------------
+def do_assemble(args):
+    d = Path(args.dir)
+    meta = json.loads((d / "meta.json").read_text())
+    W = meta["frame_width"]
+    rawH = meta["raw_frame_height"]
+    H = rawH if args.full_height else min(rawH, ELAN_MAX_FRAME_HEIGHT)
+
+    bg_raw = (d / "background.raw").read_bytes()
+    bg = elan_save_frame(bg_raw, W, H, rawH)
+
+    raws = sorted((d / "raw").glob("frame_*.bin"))
+    step(f"Assembling {len(raws)} frames, frame {W}x{H} "
+         f"(raw height {rawH}, margin {(rawH - H) // 2} cropped top+bottom)")
+
+    # --- elan_save_img_frame over the stream (elan.c:577-578) -------------
+    saved = []
+    dropped = []
+    for i, p in enumerate(raws):
+        f = elan_save_frame(p.read_bytes(), W, H, rawH)
+        s = elan_save_img_frame(f, bg)
+        if s is None:
+            dropped.append(i)
+            # The real driver FAILS THE WHOLE SSM here (elan.c:579-582).
+            continue
+        saved.append(s)
+    if dropped:
+        warn(f"{len(dropped)} frame(s) had sum==0 after background subtraction "
+             f"(indices {dropped[:10]}) -- the real driver aborts the capture on "
+             f"the first of these (elan.c:220-226 -> elan.c:579-582)")
+
+    if len(saved) < ELAN_MIN_FRAMES:
+        warn(f"only {len(saved)} usable frames; upstream requires "
+             f"ELAN_MIN_FRAMES={ELAN_MIN_FRAMES} and would report "
+             f"FP_DEVICE_RETRY_TOO_SHORT (elan.c:610-619)")
+
+    results = {}
+    variants = [("full", len(saved), False)]
+    if not args.exact:
+        # Same frames, but with calc_error's 32-bit overflow repaired. If the
+        # two disagree, the overflow -- not the fingerprint -- decided the
+        # registration.
+        variants.append(("full_err64", len(saved), True))
+    if args.simulate_stock and len(saved) > ELAN_MAX_FRAMES:
+        variants.append(("stock_max30", ELAN_MAX_FRAMES, args.exact))
+
+    for name, cap, use_exact in variants:
+        # self->frames is built with g_slist_prepend (elan.c:228) so it is
+        # newest-first; g_slist_nth(frames, ELAN_SKIP_LAST_FRAMES) at
+        # elan.c:327 drops the two MOST RECENT frames.
+        stream = saved[:cap]
+        used = stream[:len(stream) - ELAN_SKIP_LAST_FRAMES] if args.skip_last \
+            else stream
+        if len(used) < 2:
+            warn(f"[{name}] fewer than 2 frames after skipping; nothing to assemble")
+            continue
+
+        proc = [process_frame_thirds(f) if args.process == "thirds"
+                else process_frame_linear(f)[0] for f in used]
+
+        t = time.monotonic()
+        deltas, info = fpi_do_movement_estimation(
+            proc, dy_min=args.dy_min, dx_range=args.dx_range, exact=use_exact)
+        est_s = time.monotonic() - t
+
+        image_width = W * 3 // 2 if args.image_width == 0 else args.image_width
+        img, reverse, flags = fpi_assemble_frames(proc, deltas, image_width)
+
+        tag = "" if name == "full" else f".{name}"
+        write_pgm8(d / f"assembled{tag}.pgm", img)
+        maybe_png(d / f"assembled{tag}.png", img)
+        nb = normalise_like_nbis(img, flags)
+        write_pgm8(d / f"assembled{tag}.nbis-view.pgm", nb)
+        maybe_png(d / f"assembled{tag}.nbis-view.png", nb)
+
+        dys = [dy for _, dy in deltas[1:]]
+        dxs = [dx for dx, _ in deltas[1:]]
+        adys = [abs(v) for v in dys]
+        results[name] = {
+            "frames_used": len(used),
+            "assembled_w": img.shape[1],
+            "assembled_h": img.shape[0],
+            "mm_long_axis": W / PX_PER_MM,
+            "mm_swipe_axis": img.shape[0] / PX_PER_MM,
+            "reverse": reverse,
+            "flags": flags,
+            "dy": dys, "dx": dxs,
+            "dy_median": float(np.median(adys)),
+            "dy_at_floor": sum(1 for v in adys if v == args.dy_min),
+            "dy_at_ceiling": sum(1 for v in adys if v == H - 1),
+            "dx_at_rail": sum(1 for v in dxs if abs(v) >= args.dx_range - 1),
+            "forward_error": info["forward_error"],
+            "reverse_error": info["reverse_error"],
+            "chose": info["chose"],
+            "err64": use_exact,
+            "ovf_candidates": info["ovf_candidates"],
+            "ovf_total_candidates": info["ovf_total_candidates"],
+            "ovf_winners": info["ovf_winners"],
+            "estimation_seconds": est_s,
+        }
+
+        print()
+        label = {"full": "stock libfprint arithmetic (32-bit calc_error)",
+                 "full_err64": "same frames, calc_error overflow repaired",
+                 "stock_max30": "truncated to ELAN_MAX_FRAMES=30"}.get(name, name)
+        print(f"{BOLD}--- {name}: {label} ---{N}")
+        ok(f"frames used {len(used)} (of {len(saved)} saved"
+           f"{f', capped at {cap}' if cap < len(saved) else ''}"
+           f"{f', minus ELAN_SKIP_LAST_FRAMES={ELAN_SKIP_LAST_FRAMES}' if args.skip_last else ''})")
+        ok(f"assembled image {img.shape[1]} x {img.shape[0]} px "
+           f"= {img.shape[1] / PX_PER_MM:.1f} mm x {img.shape[0] / PX_PER_MM:.1f} mm "
+           f"at {DPI:.0f} dpi")
+        ok(f"area vs one press frame ({W}x{rawH}): "
+           f"{img.shape[0] * img.shape[1] / (W * rawH):.2f}x "
+           f"(finger-covered area {img.shape[0] * W / (W * rawH):.2f}x)")
+        ok(f"direction: {info['chose']} (fwd err {info['forward_error']}, "
+           f"rev err {info['reverse_error']}), assembler reverse={reverse}, flags={'|'.join(flags)}")
+        ok(f"per-frame dy: median {np.median(adys):.1f} px "
+           f"({np.median(adys) / PX_PER_MM:.2f} mm), range {min(adys)}..{max(adys)}")
+        note(f"dy sequence: {dys}")
+        note(f"dx sequence: {dxs}")
+        note(f"movement estimation took {est_s:.1f} s in this Python port")
+
+        # --- interpretation guardrails -------------------------------------
+        if results[name]["dy_at_floor"] > len(adys) * 0.5:
+            warn(f"{results[name]['dy_at_floor']}/{len(adys)} pairs pinned at the "
+                 f"dy search FLOOR ({args.dy_min}). find_overlap never searches "
+                 f"dy<2 (fpi-assembling.c:116), so this is what a *stationary* "
+                 f"finger looks like -- it is not evidence of a 2 px/frame swipe.")
+        if results[name]["dy_at_ceiling"] > 0:
+            warn(f"{results[name]['dy_at_ceiling']}/{len(adys)} pairs pinned at the "
+                 f"dy search CEILING ({H - 1}). The swipe outran the search window: "
+                 f"consecutive frames share <1 row and the registration is "
+                 f"meaningless. Swipe slower or raise the frame rate.")
+        if results[name]["dx_at_rail"] > 0:
+            warn(f"{results[name]['dx_at_rail']}/{len(dxs)} pairs hit the dx rail "
+                 f"(+-{args.dx_range}, fpi-assembling.c:118). Lateral drift is being "
+                 f"clipped; the column registration is wrong.")
+        if not use_exact and info["ovf_candidates"]:
+            pct = 100.0 * info["ovf_candidates"] / info["ovf_total_candidates"]
+            warn(f"{info['ovf_candidates']}/{info['ovf_total_candidates']} "
+                 f"({pct:.1f}%) of search candidates OVERFLOWED calc_error's "
+                 f"32-bit `err *= frame_height * frame_width` "
+                 f"(fpi-assembling.c:89, err/frame_width/frame_height are all "
+                 f"`unsigned int`). For a {W}x{H} frame that multiply needs the "
+                 f"raw SAD < {UINT32 // (W * H)}; above that it wraps modulo 2^32 "
+                 f"to a tiny value and wins the search on garbage.")
+            if info["ovf_winners"]:
+                bad(f"{info['ovf_winners']}/{len(adys)} frame pairs were won by "
+                    f"an OVERFLOWED candidate. The registration for those pairs "
+                    f"is arithmetic noise, not image content.")
+        if abs(info["forward_error"] - info["reverse_error"]) < \
+                0.02 * max(1, info["forward_error"]):
+            warn("forward and reverse errors are within 2% of each other -- the "
+                 "estimator has no real directional preference, which is what "
+                 "you see when it is not finding a registration at all.")
+
+    (d / "assembly_report.json").write_text(json.dumps(results, indent=2))
+    print()
+    ok(f"wrote {d}/assembled*.pgm, assembled*.png, assembly_report.json")
+    note("assembled.pgm        raw assembler output (as fpi_assemble_frames returns it)")
+    note("assembled.nbis-view  same image after the hflip/vflip/invert that")
+    note("                     fp-image.c:309-316 applies before NBIS sees it")
+    print()
+
+    if "full" in results and "full_err64" in results:
+        a, b = results["full"], results["full_err64"]
+        step("Does libfprint's 32-bit calc_error overflow change the answer?")
+        if a["dy"] == b["dy"] and a["dx"] == b["dx"]:
+            ok("NO: stock 32-bit and repaired 64-bit arithmetic agree on every "
+               "frame pair. The overflow is not what is limiting this capture.")
+        else:
+            ndiff = sum(1 for u, v in zip(a["dy"], b["dy"]) if u != v)
+            bad(f"YES: {ndiff}/{len(a['dy'])} frame pairs get a different dy. "
+                f"Stock assembles {a['assembled_h']} px "
+                f"({a['mm_swipe_axis']:.1f} mm), repaired assembles "
+                f"{b['assembled_h']} px ({b['mm_swipe_axis']:.1f} mm).")
+            note("Fix upstream by widening the accumulator in "
+                 "fpi-assembling.c:42-93, e.g. `unsigned long long err`, or "
+                 "normalise as `err / (height*width) * (frame_h*frame_w)`.")
+            note("This is not elan-specific code, but elan has the largest "
+                 "frames of any fpi_assemble_frames user (150x50 = 7500 px vs "
+                 "aes2501's 192x16 = 3072), so it overflows first.")
+        print()
+
+    if "full" in results and "stock_max30" in results:
+        f, s = results["full"], results["stock_max30"]
+        step("Is ELAN_MAX_FRAMES=30 binding?")
+        if f["assembled_h"] > s["assembled_h"] * 1.05:
+            bad(f"YES: capped at 30 frames the image is {s['assembled_h']} px "
+                f"({s['mm_swipe_axis']:.1f} mm); uncapped it is {f['assembled_h']} px "
+                f"({f['mm_swipe_axis']:.1f} mm). Raising ELAN_MAX_FRAMES gains "
+                f"{f['assembled_h'] - s['assembled_h']} px.")
+        else:
+            ok("NO: the capture ended (finger lifted) before 30 frames, so the "
+               "cap did not truncate this swipe.")
+    elif "full" in results and len(saved) <= ELAN_MAX_FRAMES:
+        step("Is ELAN_MAX_FRAMES=30 binding?")
+        note(f"only {len(saved)} frames were captured, at or below the cap of "
+             f"{ELAN_MAX_FRAMES}; this swipe was limited by finger lift, not by "
+             f"ELAN_MAX_FRAMES. Swipe longer/slower to test the cap.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# self-test: validate the assembler port without touching the device
+# ---------------------------------------------------------------------------
+def _synth(out, texture, dy, nframes, seed=7):
+    out = Path(out)
+    (out / "raw").mkdir(parents=True, exist_ok=True)
+    W, RAWH = 150, 52
+    rng = np.random.default_rng(seed)
+    htot = dy * nframes + RAWH + 20
+    yy, xx = np.mgrid[0:htot, 0:W]
+    if texture == "noise":
+        pat = rng.random((htot, W))
+    else:  # ridged: ~9 px pitch, the real ridge pitch at 500 dpi
+        phase = yy + 0.0018 * (xx - W / 2) ** 2 + 6 * np.sin(xx / 40.0)
+        pat = 0.5 + 0.5 * np.sin(2 * np.pi * phase / 9.0)
+    env = np.exp(-((xx - W / 2) / (W * 0.55)) ** 2)
+    big = 2000 + 9000 * pat * env + rng.normal(0, 120, (htot, W))
+    bg = 1500.0 + rng.normal(0, 40, (RAWH, W))
+
+    def raw(img):
+        return np.ascontiguousarray(np.clip(img, 0, 16383).T, dtype="<u2").tobytes()
+
+    (out / "background.raw").write_bytes(raw(bg))
+    for i in range(nframes):
+        (out / "raw" / f"frame_{i:04d}.bin").write_bytes(
+            raw(big[i * dy:i * dy + RAWH, :] + bg))
+    (out / "meta.json").write_text(json.dumps(
+        {"frame_width": W, "raw_frame_height": RAWH, "n_frames": nframes,
+         "synthetic": True, "texture": texture, "ground_truth_dy": dy}, indent=2))
+
+
+def do_selftest(args):
+    import tempfile
+    dy, nf = 12, 40
+    rc = 0
+    with tempfile.TemporaryDirectory() as td:
+        for texture, expect in (("noise", "must recover dy=12 exactly"),
+                                ("ridged", "expected to alias to the ridge pitch")):
+            d = Path(td) / texture
+            _synth(d, texture, dy, nf)
+            step(f"self-test: synthetic {texture} swipe, ground-truth dy={dy} "
+                 f"({dy / PX_PER_MM:.2f} mm/frame) -- {expect}")
+            a = argparse.Namespace(
+                dir=str(d), full_height=False, dy_min=2, dx_range=8,
+                exact=False, process="thirds", image_width=0,
+                skip_last=True, simulate_stock=False)
+            do_assemble(a)
+            rep = json.loads((d / "assembly_report.json").read_text())["full"]
+            got = int(np.median([abs(v) for v in rep["dy"]]))
+            if texture == "noise":
+                if got == dy and rep["assembled_h"] == dy * 37 + 50 \
+                        and all(v == 0 for v in rep["dx"]):
+                    ok(f"PASS: recovered dy={got}, dx=0, height="
+                       f"{rep['assembled_h']} == {dy}*37+50")
+                else:
+                    bad(f"FAIL: dy={got} (want {dy}), height={rep['assembled_h']} "
+                        f"(want {dy * 37 + 50})")
+                    rc = 1
+            else:
+                if got == dy:
+                    ok(f"recovered dy={got}; no aliasing on this synthetic")
+                else:
+                    warn(f"aliased to dy={got} instead of the true {dy}. This is "
+                         f"the periodic-texture failure mode: ridges repeat every "
+                         f"~9 px, so a shift of one ridge pitch looks as good as "
+                         f"the true shift. Expect it on real prints; it is the "
+                         f"single biggest risk to swipe reconstruction.")
+            print()
+    return rc
+
+
+# ---------------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(
+        prog="elan-swipe",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__)
+    sub = p.add_subparsers(dest="cmd")
+
+    def common(sp):
+        sp.add_argument("--full-height", action="store_true",
+                        help="do not apply the ELAN_MAX_FRAME_HEIGHT=50 crop "
+                             "(elan.c:879); use all 52 rows")
+        sp.add_argument("--dy-min", type=int, default=2,
+                        help="lowest dy find_overlap will consider "
+                             "(fpi-assembling.c:116 hardcodes 2)")
+        sp.add_argument("--dx-range", type=int, default=8,
+                        help="dx search half-width (fpi-assembling.c:118 "
+                             "hardcodes 8)")
+        sp.add_argument("--exact", action="store_true",
+                        help="use 64-bit error arithmetic instead of "
+                             "reproducing C's 32-bit overflow")
+        sp.add_argument("--process", choices=["thirds", "linear"],
+                        default="thirds",
+                        help="frame normalisation; 'thirds' is what 0c6e gets")
+        sp.add_argument("--image-width", type=int, default=0,
+                        help="0 = frame_width*3/2 as elan.c:331 does")
+        sp.add_argument("--no-skip-last", dest="skip_last",
+                        action="store_false", default=True,
+                        help="keep the last ELAN_SKIP_LAST_FRAMES frames")
+        sp.add_argument("--no-simulate-stock", dest="simulate_stock",
+                        action="store_false", default=True,
+                        help="skip the ELAN_MAX_FRAMES=30 comparison run")
+
+    c = sub.add_parser("capture", help="capture a swipe from the device")
+    c.add_argument("-n", "--max-frames", type=int, default=200,
+                   help="frame ceiling for this tool (libfprint's is 30)")
+    c.add_argument("--wait", type=int, default=20000,
+                   help="ms to wait for first finger contact")
+    c.add_argument("--settle", type=int, default=3,
+                   help="seconds of finger-off time before the background read")
+    c.add_argument("--calibrate", action="store_true",
+                   help="also run the calibration queries (default off: on fw "
+                        "0x0161 calibration reports success but capture then "
+                        "fails; this flag exists to re-test that)")
+    c.add_argument("-o", "--outdir", default=None)
+    common(c)
+
+    a = sub.add_parser("assemble", help="re-assemble an existing dump")
+    a.add_argument("dir")
+    common(a)
+
+    sub.add_parser("selftest",
+                   help="validate the libfprint assembler port on synthetic "
+                        "swipes with a known displacement; needs no device")
+
+    args = p.parse_args()
+    if args.cmd is None:
+        args = p.parse_args(["capture"])
+    if args.cmd == "selftest":
+        return do_selftest(args)
+    if args.cmd == "assemble":
+        return do_assemble(args)
+    return do_capture(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

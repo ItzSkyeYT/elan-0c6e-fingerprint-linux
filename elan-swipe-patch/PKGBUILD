@@ -1,0 +1,96 @@
+# Maintainer: melb
+#
+# libfprint built to test the SWIPE hypothesis for the ELAN 04f3:0c6e
+# (ASUS ROG Flow X13 GV301QH power-button sensor).
+#
+# This is the STOCK upstream "elan" driver -- FP_SCAN_TYPE_SWIPE, real frame
+# assembly through fpi_do_movement_estimation()/fpi_assemble_frames() -- NOT
+# the out-of-tree "elanpress" fork. The point of the package is that the 0c6e
+# is a 150x52 strip, 7.5 x 2.6 mm at 508 dpi, and 2.6 mm is far too short to
+# press a fingertip against; a swipe would reconstruct something like
+# 225 x 300-1200 px instead of one 150x52 sliver.
+#
+# Base: upstream v1.94.100-1-gc4654fd. >= 1.94.100 matters: 1.94.10's
+# elan_process_frame_linear() had g_assert (max != min), which aborts the
+# whole process on a flat frame. 1.94.100 replaced it with memset +
+# g_return_if_reached.
+#
+# On top of that, elan-0c6e-swipe.patch:
+#
+#   * fpi-assembling.c: calc_error() normalises with `err *= frame_h*frame_w`
+#     in a 32-bit unsigned. At elan's 150x50 that overflows at a mean absolute
+#     difference of only 2^32/7500 = 76 grey levels. A wrapped error is near
+#     zero, so the WORST candidate wins. Measured on this machine over 30 real
+#     0c6e captures: 0-0.5% of calc_error() calls wrap (max raw SAD 617292
+#     against a wrap threshold of 572662), and the displacements chosen by the
+#     32-bit and 64-bit versions differ on 2 of 3 sets. elan is the only user
+#     of this code whose frame is large enough for the product to overflow at
+#     all (aes2501 192x16 would need a mean difference of 455).
+#
+#   * 0x0c6e gets its own driver_data bit, ELAN_0C6E, instead of ELAN_ALL_DEV.
+#
+#   * A busy (0x00/0xaf) pre-scan reply is retried with a delay against a
+#     wall-clock budget instead of failing the capture SSM. Upstream gates
+#     that retry on ELAN_0C58 only, so 0c6e -- which answers 0xaf persistently
+#     for every session after the first since power-up -- falls into the else
+#     branch and fails. A capped retry COUNT is useless here: each reply comes
+#     back in well under a millisecond.
+#
+#   * ELAN_MAX_FRAMES raised from 30 to 100 for 0c6e only. See elan.h for the
+#     frame-rate arithmetic; 30 frames is 0.5-0.6 s of contact on this USB
+#     full-speed device, which truncates a real swipe.
+#
+#   * Runtime options, all off unless set: FP_ELAN_DUMP_DIR (per-frame and
+#     assembled PGMs), FP_ELAN_SKIP_CALIBRATION, FP_ELAN_MAX_FRAMES,
+#     FP_ELAN_MIN_FRAMES, FP_ELAN_SKIP_LAST_FRAMES, FP_ELAN_BUSY_WAIT_MS,
+#     FP_ELAN_PARTIAL. The estimated inter-frame displacements are written to
+#     the debug log and to deltas.txt either way.
+#
+# EXPERIMENTAL. No swipe capture from this sensor has ever been published, by
+# anyone, so nothing here is known to work. Installing this REPLACES the
+# system libfprint. Do not wire it to PAM.
+
+pkgname=libfprint-elanswipe
+_commit=c4654fdc85c25afdd9115bec2f95a44145ae3b94   # v1.94.100-1-gc4654fd
+pkgver=1.94.100.elanswipe
+pkgrel=1
+pkgdesc="libfprint with the stock elan SWIPE driver instrumented for ELAN 0C6E (ROG Flow X13) - EXPERIMENTAL, unproven, do not use with PAM"
+url="https://gitlab.freedesktop.org/libfprint/libfprint"
+arch=(x86_64)
+license=('LGPL-2.1-or-later')
+depends=(libgusb pixman nss systemd libgudev)
+makedepends=(git meson gobject-introspection)
+conflicts=(libfprint libfprint-elanpress libfprint-elan0c6e)
+provides=(libfprint libfprint-2.so=2-64)
+groups=(fprint)
+
+# Pinned local mirror of https://gitlab.freedesktop.org/libfprint/libfprint.git
+# so the build does not need the network. Re-point at the upstream URL to
+# build from scratch elsewhere; the commit hash is the same object either way.
+source=("libfprint::git+file:///home/melb/projects/libfprint-elanswipe-pkg/libfprint-upstream#commit=${_commit}"
+        "elan-0c6e-swipe.patch")
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+  cd "$srcdir/libfprint"
+  patch -p1 < "$srcdir/elan-0c6e-swipe.patch"
+}
+
+build() {
+  # NOTE: introspection must stay ON. With -Dintrospection=false, upstream's
+  # tests/meson.build takes a branch that iterates a dict with one loop
+  # variable, which meson >= 1.11 rejects outright at configure time.
+  arch-meson libfprint build \
+    -D doc=false \
+    -D gtk-examples=false
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --suite=libfprint --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

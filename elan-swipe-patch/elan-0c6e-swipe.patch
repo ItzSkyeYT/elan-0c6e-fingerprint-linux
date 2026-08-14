@@ -1,0 +1,789 @@
+diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+index f9cc52f..532c1be 100644
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -41,6 +41,70 @@
+ #include "drivers_api.h"
+ #include "elan.h"
+ 
++#include <stdio.h>
++#include <stdarg.h>
++#include <errno.h>
++
++/* ------------------------------------------------------------- options ----
++ *
++ * The 0c6e (ASUS ROG Flow X13 power button) is a 150x52 strip for which no
++ * working swipe capture has ever been published, so the things worth varying
++ * while testing it are environment variables rather than compiled-in
++ * constants. All are read at the point of use, and none of them changes
++ * behaviour for any other device unless explicitly set.
++ *
++ *   FP_ELAN_DUMP_DIR=DIR       write per-frame and assembled PGMs under DIR
++ *   FP_ELAN_SKIP_CALIBRATION=  1/0 - skip the calibration loop (the
++ *                              background frame is still captured; capture
++ *                              cannot work without it). Defaults to 1 on
++ *                              0c6e, 0 elsewhere.
++ *   FP_ELAN_MAX_FRAMES=N       frames per capture (default 100 on 0c6e)
++ *   FP_ELAN_MIN_FRAMES=N       frames below which a capture is discarded
++ *   FP_ELAN_SKIP_LAST_FRAMES=N frames dropped from the end of the capture
++ *   FP_ELAN_BUSY_WAIT_MS=N     how long to keep retrying a busy pre-scan
++ *                              reply while waiting for a finger (0 = forever)
++ *   FP_ELAN_PARTIAL=0          clear FPI_IMAGE_PARTIAL so that NBIS keeps
++ *                              perimeter minutiae
++ */
++
++static gboolean
++elan_opt_bool (const char *name, gboolean fallback)
++{
++  const char *v = g_getenv (name);
++
++  if (v == NULL || *v == '\0')
++    return fallback;
++
++  if (g_ascii_strcasecmp (v, "0") == 0 ||
++      g_ascii_strcasecmp (v, "no") == 0 ||
++      g_ascii_strcasecmp (v, "off") == 0 ||
++      g_ascii_strcasecmp (v, "false") == 0)
++    return FALSE;
++
++  return TRUE;
++}
++
++static int
++elan_opt_int (const char *name, int fallback, int min, int max)
++{
++  const char *v = g_getenv (name);
++  char *end = NULL;
++  gint64 n;
++
++  if (v == NULL || *v == '\0')
++    return fallback;
++
++  n = g_ascii_strtoll (v, &end, 10);
++  if (end == v || *end != '\0' || n < min || n > max)
++    {
++      fp_warn ("%s=\"%s\" is not an integer in [%d, %d]; using %d",
++               name, v, min, max, fallback);
++      return fallback;
++    }
++
++  return (int) n;
++}
++
+ static unsigned char
+ elan_get_pixel (struct fpi_frame_asmbl_ctx *ctx,
+                 struct fpi_frame *frame, unsigned int x,
+@@ -85,9 +149,192 @@ struct _FpiDeviceElan
+   int             num_frames;
+   GSList         *frames;
+   /* end state */
++
++  /* busy (0x00/0xaf) pre-scan handling */
++  gint64          busy_deadline_us;     /* 0 = no deadline */
++  gint64          busy_since_us;        /* start of the current busy run */
++  int             busy_retries;
++  /* end busy handling */
++
++  /* debug dump, only when FP_ELAN_DUMP_DIR is set */
++  char           *dump_dir;
++  gint64          dump_t0_us;
++  int             dropped_frames;
++  /* end debug dump */
+ };
+ G_DEFINE_TYPE (FpiDeviceElan, fpi_device_elan, FP_TYPE_IMAGE_DEVICE);
+ 
++static int
++elan_max_frames (FpiDeviceElan *self)
++{
++  return elan_opt_int ("FP_ELAN_MAX_FRAMES",
++                       ELAN_MAX_FRAMES (self->dev_type), 1, 2000);
++}
++
++static int
++elan_min_frames (FpiDeviceElan *self)
++{
++  return elan_opt_int ("FP_ELAN_MIN_FRAMES", ELAN_MIN_FRAMES,
++                       1, elan_max_frames (self));
++}
++
++static int
++elan_skip_last_frames (FpiDeviceElan *self)
++{
++  return elan_opt_int ("FP_ELAN_SKIP_LAST_FRAMES", ELAN_SKIP_LAST_FRAMES,
++                       0, elan_max_frames (self) - 1);
++}
++
++static int
++elan_busy_wait_ms (FpiDeviceElan *self)
++{
++  (void) self;
++  return elan_opt_int ("FP_ELAN_BUSY_WAIT_MS", ELAN_BUSY_WAIT_MS, 0, 600000);
++}
++
++/* Whether to skip the calibration loop. On fw 0x0161 (the ROG Flow X13)
++ * calibration reports success -- delta 347 against a max of 500 -- and
++ * capture then fails anyway, so historically it was skipped for this PID.
++ * That has never been re-verified, hence the override: FP_ELAN_SKIP_CALIBRATION=0
++ * forces calibration back on so both can be tested in one session. */
++static gboolean
++elan_skip_calibration (FpiDeviceElan *self)
++{
++  return elan_opt_bool ("FP_ELAN_SKIP_CALIBRATION",
++                        self->dev_type == ELAN_0C6E);
++}
++
++/* ---------------------------------------------------------- debug dump ----
++ *
++ * Raw frames are what the sensor actually returned; the assembled image is
++ * what fpi_assemble_frames made of them. Both are needed to tell "the sensor
++ * streams nothing usable during motion" apart from "the sensor is fine and
++ * the stitcher failed", which is the whole open question for this device.
++ */
++
++static void
++elan_dump_pgm8 (const char          *path,
++                const unsigned char *px,
++                unsigned int         w,
++                unsigned int         h)
++{
++  FILE *f = fopen (path, "wb");
++
++  if (f == NULL)
++    {
++      fp_warn ("cannot write %s: %s", path, g_strerror (errno));
++      return;
++    }
++  fprintf (f, "P5\n%u %u\n255\n", w, h);
++  fwrite (px, 1, (size_t) w * h, f);
++  fclose (f);
++}
++
++/* 16-bit PGM, big-endian samples as the format requires. maxval is declared
++ * as 16383 because that is the sensor's ADC range, not the observed max, so
++ * grey levels stay comparable between frames. */
++static void
++elan_dump_pgm16 (const char           *path,
++                 const unsigned short *px,
++                 unsigned int          w,
++                 unsigned int          h)
++{
++  FILE *f = fopen (path, "wb");
++  unsigned char *be;
++  size_t n = (size_t) w * h;
++
++  if (f == NULL)
++    {
++      fp_warn ("cannot write %s: %s", path, g_strerror (errno));
++      return;
++    }
++  fprintf (f, "P5\n%u %u\n16383\n", w, h);
++  be = g_malloc (n * 2);
++  for (size_t i = 0; i < n; i++)
++    {
++      unsigned short v = px[i] > 16383 ? 16383 : px[i];
++      be[2 * i] = v >> 8;
++      be[2 * i + 1] = v & 0xff;
++    }
++  fwrite (be, 1, n * 2, f);
++  g_free (be);
++  fclose (f);
++}
++
++static void
++elan_dump_append (FpiDeviceElan *self, const char *name, const char *fmt, ...)
++G_GNUC_PRINTF (3, 4);
++
++static void
++elan_dump_append (FpiDeviceElan *self, const char *name, const char *fmt, ...)
++{
++  g_autofree char *path = NULL;
++  g_autofree char *text = NULL;
++  va_list ap;
++  FILE *f;
++
++  if (self->dump_dir == NULL)
++    return;
++
++  va_start (ap, fmt);
++  text = g_strdup_vprintf (fmt, ap);
++  va_end (ap);
++
++  path = g_build_filename (self->dump_dir, name, NULL);
++  f = fopen (path, "a");
++  if (f == NULL)
++    {
++      fp_warn ("cannot append to %s: %s", path, g_strerror (errno));
++      return;
++    }
++  fputs (text, f);
++  fclose (f);
++}
++
++/* One directory per capture attempt: the first attempts are expected to fail
++ * and overwriting them would destroy exactly the evidence being collected. */
++static void
++elan_dump_begin (FpiDeviceElan *self)
++{
++  static int seq = 0;
++  const char *base = g_getenv ("FP_ELAN_DUMP_DIR");
++
++  g_autoptr(GDateTime) now = NULL;
++  g_autofree char *stamp = NULL;
++  g_autofree char *name = NULL;
++
++  g_clear_pointer (&self->dump_dir, g_free);
++  self->dump_t0_us = g_get_monotonic_time ();
++  self->dropped_frames = 0;
++
++  if (base == NULL || *base == '\0')
++    return;
++
++  now = g_date_time_new_now_local ();
++  stamp = g_date_time_format (now, "%Y%m%d-%H%M%S");
++  name = g_strdup_printf ("capture-%s-%03d", stamp, ++seq);
++  self->dump_dir = g_build_filename (base, name, NULL);
++
++  if (g_mkdir_with_parents (self->dump_dir, 0755) != 0)
++    {
++      fp_warn ("cannot create dump dir %s: %s", self->dump_dir,
++               g_strerror (errno));
++      g_clear_pointer (&self->dump_dir, g_free);
++      return;
++    }
++
++  fp_dbg ("dumping this capture to %s", self->dump_dir);
++  elan_dump_append (self, "capture.txt",
++                    "dev_type 0x%04x\nfw_ver 0x%04x\n"
++                    "max_frames %d\nmin_frames %d\nskip_last_frames %d\n"
++                    "skip_calibration %d\nbusy_wait_ms %d\n",
++                    self->dev_type, self->fw_ver,
++                    elan_max_frames (self), elan_min_frames (self),
++                    elan_skip_last_frames (self),
++                    elan_skip_calibration (self) ? 1 : 0,
++                    elan_busy_wait_ms (self));
++}
++
+ static int
+ cmp_short (const void *a, const void *b)
+ {
+@@ -160,6 +407,14 @@ elan_save_background (FpiDeviceElan *elandev)
+     g_malloc (elandev->frame_width * elandev->frame_height *
+               sizeof (short));
+   elan_save_frame (elandev, elandev->background);
++
++  if (elandev->dump_dir)
++    {
++      g_autofree char *path =
++        g_build_filename (elandev->dump_dir, "background.pgm", NULL);
++      elan_dump_pgm16 (path, elandev->background,
++                       elandev->frame_width, elandev->frame_height);
++    }
+ }
+ 
+ /* save a frame as part of the fingerprint image
+@@ -206,6 +461,23 @@ elan_save_img_frame (FpiDeviceElan *elandev)
+   unsigned short *frame = g_malloc (frame_size * sizeof (short));
+ 
+   elan_save_frame (elandev, frame);
++
++  /* Dumped before the background subtraction below, which is lossy (it
++   * clamps at zero). raw_NNN.pgm plus background.pgm reproduce the saved
++   * frame exactly, and the index is the capture order. */
++  if (elandev->dump_dir)
++    {
++      g_autofree char *name =
++        g_strdup_printf ("raw_%03d.pgm", elandev->num_frames);
++      g_autofree char *path =
++        g_build_filename (elandev->dump_dir, name, NULL);
++      elan_dump_pgm16 (path, frame, elandev->frame_width,
++                       elandev->frame_height);
++      elan_dump_append (elandev, "timings.txt", "%d %.1f\n",
++                        elandev->num_frames,
++                        (g_get_monotonic_time () - elandev->dump_t0_us) / 1000.0);
++    }
++
+   unsigned int sum = 0;
+ 
+   for (int i = 0; i < frame_size; i++)
+@@ -320,19 +592,161 @@ elan_submit_image (FpImageDevice *dev)
+   FpiDeviceElan *self = FPI_DEVICE_ELAN (dev);
+   GSList *raw_frames;
+   GSList *frames = NULL;
++  GSList *l;
+   FpImage *img;
++  int skip = elan_skip_last_frames (self);
++  int i;
++  int sum_dy = 0, sum_abs_dx = 0, railed_dy = 0, railed_dx = 0;
++  g_autoptr(GString) deltas = NULL;
+ 
+   G_DEBUG_HERE ();
+ 
+-  raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
++  /* self->frames is built with g_slist_prepend, so it is newest-first and
++   * skipping the head drops the frames captured while the finger was being
++   * lifted. What is left is newest-to-oldest; process_frame prepends again,
++   * so `frames` comes out oldest-to-newest, i.e. capture order. */
++  raw_frames = g_slist_nth (self->frames, skip);
+ 
+   assembling_ctx.frame_width = self->frame_width;
+   assembling_ctx.frame_height = self->frame_height;
+   assembling_ctx.image_width = self->frame_width * 3 / 2;
+   g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
++
++  if (frames == NULL)
++    {
++      fp_warn ("no frames left to assemble");
++      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
++      return;
++    }
++
+   fpi_do_movement_estimation (&assembling_ctx, frames);
++
++  /* The estimated inter-frame displacements are THE diagnostic for whether
++   * assembly worked. fpi_do_movement_estimation leaves the first frame's
++   * deltas untouched (they come from g_malloc), so zero them before reading;
++   * fpi_assemble_frames does the same thing again below. */
++  ((struct fpi_frame *) frames->data)->delta_x = 0;
++  ((struct fpi_frame *) frames->data)->delta_y = 0;
++
++  deltas = g_string_new (NULL);
++  for (l = frames, i = 0; l != NULL; l = l->next, i++)
++    {
++      struct fpi_frame *f = l->data;
++
++      sum_dy += f->delta_y;
++      if (i > 0)
++        {
++          sum_abs_dx += ABS (f->delta_x);
++          /* find_overlap searches dy in [2, frame_height) and dx in [-8, 8).
++           * Hitting a limit on most frames means it never found a real
++           * registration, it just fell off the end of the search window. */
++          if (f->delta_y <= 2 || f->delta_y >= (int) assembling_ctx.frame_height - 1)
++            railed_dy++;
++          if (ABS (f->delta_x) >= 8)
++            railed_dx++;
++        }
++      fp_dbg ("frame %3d: delta_x %4d delta_y %4d  (y %d)",
++              i, f->delta_x, f->delta_y, sum_dy);
++      g_string_append_printf (deltas, "%d\n", f->delta_y);
++    }
++
++  fp_dbg ("displacement summary: %d frames, sum delta_y %d, mean delta_y %.2f, "
++          "mean |delta_x| %.2f, delta_y at search limit %d/%d, "
++          "|delta_x| at limit %d/%d",
++          i, sum_dy, i > 1 ? (double) sum_dy / (i - 1) : 0.0,
++          i > 1 ? (double) sum_abs_dx / (i - 1) : 0.0,
++          railed_dy, i - 1, railed_dx, i - 1);
++  if (i > 1 && railed_dy * 2 >= i - 1)
++    fp_warn ("most frames hit the delta_y search limit: the frames probably "
++             "do not overlap in a way find_overlap can register");
++
+   img = fpi_assemble_frames (&assembling_ctx, frames);
+-  img->flags |= FPI_IMAGE_PARTIAL;
++
++  if (self->dev_type == ELAN_0C6E)
++    img->ppmm = ELAN_0C6E_PPMM;
++
++  if (elan_opt_bool ("FP_ELAN_PARTIAL", TRUE))
++    img->flags |= FPI_IMAGE_PARTIAL;
++  else
++    fp_dbg ("FPI_IMAGE_PARTIAL cleared, NBIS will keep perimeter minutiae");
++
++  fp_dbg ("assembled image %ux%u from %d frames (%d captured, %d skipped), "
++          "ppmm %.2f, flags 0x%x",
++          img->width, img->height, i, self->num_frames, skip,
++          img->ppmm, (unsigned int) img->flags);
++
++  if (self->dump_dir)
++    {
++      g_autofree char *dpath = NULL;
++      g_autofree char *apath = NULL;
++      g_autofree char *npath = NULL;
++      unsigned char *view;
++      gsize npx = (gsize) img->width * img->height;
++
++      /* One processed 8-bit frame per file, in assembly order: these are the
++       * pixels the stitcher actually saw, after elan_process_frame_*. */
++      for (l = frames, i = 0; l != NULL; l = l->next, i++)
++        {
++          struct fpi_frame *f = l->data;
++          g_autofree char *name = g_strdup_printf ("proc_%03d.pgm", i);
++          g_autofree char *path = g_build_filename (self->dump_dir, name, NULL);
++          elan_dump_pgm8 (path, f->data, assembling_ctx.frame_width,
++                          assembling_ctx.frame_height);
++        }
++
++      /* One delta_y per line, in assembly order: this is the format
++       * analyze-swipe.py --seams expects (it takes the cumulative sum to get
++       * the seam rows). */
++      dpath = g_build_filename (self->dump_dir, "deltas.txt", NULL);
++      g_file_set_contents (dpath, deltas->str, -1, NULL);
++
++      apath = g_build_filename (self->dump_dir, "assembled.pgm", NULL);
++      elan_dump_pgm8 (apath, img->data, img->width, img->height);
++
++      /* Same image with img->flags applied, i.e. what NBIS is handed. */
++      view = g_memdup2 (img->data, npx);
++      if (img->flags & FPI_IMAGE_H_FLIPPED)
++        for (gsize y = 0; y < img->height; y++)
++          for (gsize x = 0; x < img->width / 2; x++)
++            {
++              unsigned char t = view[y * img->width + x];
++              view[y * img->width + x] = view[y * img->width + img->width - 1 - x];
++              view[y * img->width + img->width - 1 - x] = t;
++            }
++      if (img->flags & FPI_IMAGE_V_FLIPPED)
++        for (gsize y = 0; y < img->height / 2; y++)
++          for (gsize x = 0; x < img->width; x++)
++            {
++              unsigned char t = view[y * img->width + x];
++              view[y * img->width + x] = view[(img->height - 1 - y) * img->width + x];
++              view[(img->height - 1 - y) * img->width + x] = t;
++            }
++      if (img->flags & FPI_IMAGE_COLORS_INVERTED)
++        for (gsize p = 0; p < npx; p++)
++          view[p] = 0xff - view[p];
++      npath = g_build_filename (self->dump_dir, "assembled_nbis.pgm", NULL);
++      elan_dump_pgm8 (npath, view, img->width, img->height);
++      g_free (view);
++
++      elan_dump_append (self, "capture.txt",
++                        "frames_captured %d\nframes_dropped %d\n"
++                        "frames_assembled %d\nframe_width %d\nframe_height %d\n"
++                        "raw_frame_height %d\nimage_width %d\n"
++                        "assembled_width %u\nassembled_height %u\n"
++                        "sum_delta_y %d\nmean_delta_y %.2f\nmean_abs_delta_x %.2f\n"
++                        "delta_y_at_limit %d\ndelta_x_at_limit %d\n"
++                        "ppmm %.2f\nflags 0x%x\n"
++                        "elapsed_ms %.1f\n",
++                        self->num_frames, self->dropped_frames, i,
++                        self->frame_width, self->frame_height,
++                        self->raw_frame_height, assembling_ctx.image_width,
++                        img->width, img->height,
++                        sum_dy, i > 1 ? (double) sum_dy / (i - 1) : 0.0,
++                        i > 1 ? (double) sum_abs_dx / (i - 1) : 0.0,
++                        railed_dy, railed_dx, img->ppmm,
++                        (unsigned int) img->flags,
++                        (g_get_monotonic_time () - self->dump_t0_us) / 1000.0);
++    }
+ 
+   g_slist_free_full (frames, g_free);
+ 
+@@ -542,11 +956,26 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+     case CAPTURE_LED_ON:
+-      elan_run_cmd (ssm, dev, &led_on_cmd, ELAN_CMD_TIMEOUT);
+-      break;
++      {
++        int wait_ms = elan_busy_wait_ms (self);
++
++        self->busy_deadline_us = wait_ms > 0 ?
++                                 g_get_monotonic_time () + (gint64) wait_ms * 1000 : 0;
++        self->busy_since_us = 0;
++        self->busy_retries = 0;
++        elan_run_cmd (ssm, dev, &led_on_cmd, ELAN_CMD_TIMEOUT);
++        break;
++      }
+ 
+     case CAPTURE_WAIT_FINGER:
+-      elan_run_cmd (ssm, dev, &pre_scan_cmd, -1);
++      /* Before the first frame this is the "waiting for the user" wait, so
++       * give it the whole busy budget rather than ELAN_CMD_TIMEOUT: a device
++       * that blocks in pre_scan instead of answering 0xaf should wait just as
++       * long as one that busy-replies. Afterwards keep whatever the previous
++       * state set (ELAN_FINGER_TIMEOUT), which is what ends the swipe. */
++      elan_run_cmd (ssm, dev, &pre_scan_cmd,
++                    self->num_frames == 0 ?
++                    MAX (elan_busy_wait_ms (self), ELAN_CMD_TIMEOUT) : -1);
+       break;
+ 
+     case CAPTURE_READ_DATA:
+@@ -554,15 +983,61 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+        * 0xff - device not calibrated (probably) */
+       if (self->last_read && self->last_read[0] == 0x55)
+         {
++          self->busy_since_us = 0;
+           fpi_image_device_report_finger_status (idev, TRUE);
+           elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
+         }
+-      else if (self->dev_type == ELAN_0C58 && self->last_read &&
++      else if ((self->dev_type & (ELAN_0C58 | ELAN_0C6E)) && self->last_read &&
+                (self->last_read[0] == 0x00 || self->last_read[0] == 0xaf))
+         {
+           /* 0x00 - not ready
+-           * 0xaf - finger removed or sensor busy (seen on 0x0c58) */
+-          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 10);
++           * 0xaf - finger removed, or the sensor is busy. Seen on 0x0c58, and
++           *        on 0x0c6e it is answered persistently for the whole of
++           *        every session after the first since power-up.
++           *
++           * Retrying a bounded number of times is useless here: each reply
++           * comes back in well under a millisecond, so even a few hundred
++           * retries are exhausted before a human can reach the sensor. The
++           * budget is therefore wall-clock (ELAN_BUSY_WAIT_MS, 0 = forever)
++           * and the retry is delayed so it does not spin the CPU.
++           *
++           * Once frames are being captured the meaning changes: a sustained
++           * run of busy replies means the finger has left, so end the capture
++           * with what we have rather than waiting for the whole budget. */
++          gint64 now = g_get_monotonic_time ();
++
++          if (self->busy_since_us == 0)
++            self->busy_since_us = now;
++          self->busy_retries++;
++
++          if (self->num_frames > 0 &&
++              now - self->busy_since_us > ELAN_BUSY_LIFT_MS * 1000)
++            {
++              fp_dbg ("finger left the sensor after %d frames "
++                      "(busy for %" G_GINT64_FORMAT " ms)",
++                      self->num_frames,
++                      (now - self->busy_since_us) / 1000);
++              fpi_ssm_mark_completed (ssm);
++            }
++          else if (self->num_frames == 0 && self->busy_deadline_us != 0 &&
++                   now > self->busy_deadline_us)
++            {
++              fp_dbg ("sensor answered busy (0x%02x) for the whole wait, "
++                      "%d retries, giving up", self->last_read[0],
++                      self->busy_retries);
++              /* No error: capture_complete turns this into a TOO_SHORT retry,
++               * which lets fprintd re-arm instead of failing the session. */
++              fpi_ssm_mark_completed (ssm);
++            }
++          else
++            {
++              if (self->busy_retries == 1 || self->busy_retries % 100 == 0)
++                fp_dbg ("sensor busy (0x%02x), retry %d after %" G_GINT64_FORMAT " ms",
++                        self->last_read[0], self->busy_retries,
++                        (now - self->busy_since_us) / 1000);
++              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER,
++                                             ELAN_BUSY_RETRY_DELAY_MS);
++            }
+         }
+       else
+         {
+@@ -576,11 +1051,29 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+ 
+     case CAPTURE_CHECK_ENOUGH_FRAMES:
+       r = elan_save_img_frame (self);
+-      if (r < 0)
++      if (r < 0 && self->dev_type == ELAN_0C6E)
++        {
++          /* A frame darker than the background is fatal upstream. During a
++           * swipe it is not: the leading and trailing frames of a real swipe
++           * can legitimately be near-empty, and throwing away the whole
++           * capture for one of them would make a swipe impossible to test.
++           * Drop the frame and keep going; the frame cap still bounds this. */
++          self->dropped_frames++;
++          fp_dbg ("dropping dark frame %d (%d dropped so far)",
++                  self->num_frames, self->dropped_frames);
++          if (self->num_frames + self->dropped_frames >= elan_max_frames (self))
++            fpi_ssm_next_state (ssm);
++          else
++            {
++              self->cmd_timeout = ELAN_FINGER_TIMEOUT;
++              fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_FINGER);
++            }
++        }
++      else if (r < 0)
+         {
+           fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
+         }
+-      else if (self->num_frames < ELAN_MAX_FRAMES)
++      else if (self->num_frames < elan_max_frames (self))
+         {
+           /* quickly stop if finger is removed */
+           self->cmd_timeout = ELAN_FINGER_TIMEOUT;
+@@ -607,14 +1100,20 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
+        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
+     {
+-      if (self->num_frames >= ELAN_MIN_FRAMES)
++      if (self->num_frames >= elan_min_frames (self))
+         {
+           elan_submit_image (dev);
+         }
+       else
+         {
+-          fp_dbg ("swipe too short: want >= %d frames, got %d",
+-                  ELAN_MIN_FRAMES, self->num_frames);
++          fp_dbg ("swipe too short: want >= %d frames, got %d (%d dropped)",
++                  elan_min_frames (self), self->num_frames,
++                  self->dropped_frames);
++          elan_dump_append (self, "capture.txt",
++                            "frames_captured %d\nframes_dropped %d\n"
++                            "result too-short\nelapsed_ms %.1f\n",
++                            self->num_frames, self->dropped_frames,
++                            (g_get_monotonic_time () - self->dump_t0_us) / 1000.0);
+           fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
+         }
+       g_clear_error (&error);
+@@ -694,6 +1193,12 @@ enum calibrate_states {
+ static gboolean
+ elan_supports_calibration (FpiDeviceElan *elandev)
+ {
++  if (elan_skip_calibration (elandev))
++    {
++      fp_dbg ("calibration skipped by request (FP_ELAN_SKIP_CALIBRATION)");
++      return FALSE;
++    }
++
+   if (elandev->dev_type == ELAN_0C42)
+     return TRUE;
+ 
+@@ -810,6 +1315,11 @@ elan_calibrate (FpiDeviceElan *self)
+ 
+   elan_dev_reset_state (self);
+ 
++  /* One dump directory per attempt, opened here rather than in elan_capture
++   * so that the background frame lands beside the frames it is subtracted
++   * from. */
++  elan_dump_begin (self);
++
+   g_return_if_fail (!self->active);
+   self->active = TRUE;
+   self->calib_atts_left = ELAN_CALIBRATION_ATTEMPTS (self->dev_type);
+@@ -944,6 +1454,14 @@ dev_init (FpImageDevice *dev)
+       break;
+     }
+ 
++  fp_dbg ("elan config: dev_type 0x%04x, max_frames %d, min_frames %d, "
++          "skip_last %d, skip_calibration %d, busy_wait %d ms, dump %s",
++          self->dev_type, elan_max_frames (self), elan_min_frames (self),
++          elan_skip_last_frames (self), elan_skip_calibration (self) ? 1 : 0,
++          elan_busy_wait_ms (self),
++          g_getenv ("FP_ELAN_DUMP_DIR") ?
++          g_getenv ("FP_ELAN_DUMP_DIR") : "off");
++
+   fpi_image_device_open_complete (dev, NULL);
+ }
+ 
+@@ -957,6 +1475,7 @@ dev_deinit (FpImageDevice *dev)
+ 
+   elan_dev_reset_state (self);
+   g_free (self->background);
++  g_clear_pointer (&self->dump_dir, g_free);
+   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
+                                   0, 0, &error);
+   fpi_image_device_close_complete (dev, error);
+diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
+index 6bbaae0..bd3dc7c 100644
+--- a/libfprint/drivers/elan.h
++++ b/libfprint/drivers/elan.h
+@@ -32,6 +32,7 @@
+ #define ELAN_0C03 (1 << 1)
+ #define ELAN_0C42 (1 << 2)
+ #define ELAN_0C58 (1 << 3)
++#define ELAN_0C6E (1 << 4)
+ 
+ /* devices which don't require frame rotation before assembling */
+ #define ELAN_NOT_ROTATED ELAN_0C03
+@@ -51,7 +52,54 @@
+ 
+ /* min and max frames in a capture */
+ #define ELAN_MIN_FRAMES 7
+-#define ELAN_MAX_FRAMES 30
++#define ELAN_DEFAULT_MAX_FRAMES 30
++
++/* The 0c6e is a 150x52 strip (7.5 x 2.6 mm at 508 dpi): 2.6 mm is far too
++ * short to press a fingertip against, so the only way to cover a finger is a
++ * swipe, and a swipe needs enough frames to cover it.
++ *
++ * Frame rate: this device sits on a USB full-speed bus (measured: the sysfs
++ * "speed" attribute of its USB device reads 12) with 64-byte bulk endpoints.
++ * Full-speed
++ * bulk tops out at 19 x 64 B per 1 ms frame = 1216 B/ms, so the 15600-byte
++ * image alone takes >= 12.8 ms, and with the pre-scan OUT+IN and the
++ * get_image OUT issued as separate sequential URBs a frame costs roughly
++ * 16-20 ms, i.e. 50-60 fps.
++ *
++ * A deliberate swipe over a ~15 mm fingertip at 15-25 mm/s takes 0.6-1.0 s,
++ * which is 30-60 frames, and a slow or hesitant one is longer. The stock cap
++ * of 30 is therefore 0.5-0.6 s of contact: it truncates a real swipe part
++ * way through and throws away its tail. It also caps the assembled length at
++ * (30 - 1 - ELAN_SKIP_LAST_FRAMES) * delta_y + frame_height.
++ *
++ * 100 frames is 1.7-2.0 s of contact, longer than any deliberate swipe, so
++ * the terminator becomes the 200 ms finger-lift timeout (the intended one)
++ * rather than the cap. The cost is bounded and small: 100 raw frames is
++ * 100 * 150 * 52 * 2 = 1.5 MB, the processed copies are another 0.75 MB, and
++ * movement estimation is O(frames). Left at 30 for every other device, none
++ * of which is this thin. */
++#define ELAN_0C6E_MAX_FRAMES 100
++
++#define ELAN_MAX_FRAMES(dev_type) \
++  ((dev_type) == ELAN_0C6E ? ELAN_0C6E_MAX_FRAMES : ELAN_DEFAULT_MAX_FRAMES)
++
++/* pixels per millimetre, from the ELAN eFSA515 datasheet figure of 508 dpi
++ * (508 / 25.4 = 20.0 exactly). Nothing in libfprint sets FpImage.ppmm except
++ * secugen, and NBIS derives its quality-map radius from it, so leaving it at
++ * zero silently degrades quality scoring. */
++#define ELAN_0C6E_PPMM 20.0
++
++/* How long to keep retrying a "busy" (0x00/0xaf) pre-scan reply while waiting
++ * for the finger, and the delay between retries. This has to be a wall-clock
++ * budget rather than a retry count: a busy reply comes back in well under a
++ * millisecond, so any small count is exhausted long before a human can reach
++ * the sensor. 0 disables the deadline entirely (retry forever). */
++#define ELAN_BUSY_WAIT_MS 30000
++#define ELAN_BUSY_RETRY_DELAY_MS 20
++
++/* Once frames are being captured, an unbroken run of busy replies this long
++ * means the finger has left the sensor and the swipe is over. */
++#define ELAN_BUSY_LIFT_MS 300
+ 
+ /* crop frames to this height to improve stitching */
+ #define ELAN_MAX_FRAME_HEIGHT 50
+@@ -222,7 +270,7 @@ static const FpIdEntry elan_id_table[] = {
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c63, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_ALL_DEV},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_0C6E},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c58, .driver_data = ELAN_0C58},
+   {.vid = 0,  .pid = 0,  .driver_data = 0},
+ };
+diff --git a/libfprint/fpi-assembling.c b/libfprint/fpi-assembling.c
+index 9364685..7fc2fc5 100644
+--- a/libfprint/fpi-assembling.c
++++ b/libfprint/fpi-assembling.c
+@@ -47,7 +47,19 @@ calc_error (struct fpi_frame_asmbl_ctx *ctx,
+             int                         dy)
+ {
+   unsigned int width, height;
+-  unsigned int x1, y1, x2, y2, err, i, j;
++  unsigned int x1, y1, x2, y2, i, j;
++  /* 64-bit. The normalisation below multiplies before it divides, and for a
++   * frame as large as elan's 150x50 the product overflows 32 bits at a mean
++   * absolute difference of only 2^32 / (150*50) = 76 grey levels, which is
++   * easily reached with 8-bit pixels. A wrapped error is near zero, so the
++   * WORST candidate wins and the reconstruction is silently compressed --
++   * observed on a synthetic ridged swipe with known dy=12, where the 32-bit
++   * version picked an overflowed candidate for all 37 frame pairs and
++   * returned dy=9. Every other user of this file has a frame small enough
++   * that the product cannot overflow at all (aes2501 192x16 would need a
++   * mean difference of 455, aes1610 128x8 needs 4096), which is why this has
++   * never been hit before. */
++  unsigned long long err;
+ 
+   width = ctx->frame_width - (dx > 0 ? dx : -dx);
+   height = ctx->frame_height - dy;
+@@ -85,11 +97,12 @@ calc_error (struct fpi_frame_asmbl_ctx *ctx,
+     }
+   while (i < height);
+ 
+-  /* Normalize error */
+-  err *= (ctx->frame_height * ctx->frame_width);
+-  err /= (height * width);
++  /* Normalize error. Done in 64 bits; the result is bounded by
++   * 255 * frame_height * frame_width and so always fits the return type. */
++  err *= (unsigned long long) ctx->frame_height * ctx->frame_width;
++  err /= (unsigned long long) height * width;
+ 
+-  return err;
++  return err > UINT_MAX ? UINT_MAX : (unsigned int) err;
+ }
+ 
+ /* This function is rather CPU-intensive. It's better to use hardware
