@@ -18,6 +18,8 @@
 #   elan-fp collect L  capture a labelled dataset for offline matcher work
 #   elan-fp swipe      capture ONE swipe, dump the frames, judge the assembly
 #   elan-fp swipe-report D   re-judge an already-captured swipe directory
+#   elan-fp swipe-enroll     enroll by SWIPING, building one map of the finger
+#   elan-fp swipe-test       verify by SWIPING, N times, and report a match rate
 #
 # `swipe` exits 0 if the assembled image passed every failure test, 2 if it
 # assembled but did not, 1 if nothing assembled, 3 if the swipe driver is not
@@ -43,14 +45,23 @@ VERIFY_TIMEOUT=40      # generous: user must physically touch the sensor
 ENROLL_TIMEOUT=180     # enrollment needs several touches
 SETTLE=2               # seconds to let the device re-enumerate
 SWIPE_TIMEOUT=75       # one swipe attempt: prompt, swipe, assemble, report
+# The swipe driver does real work per attempt, and the numbers below are
+# measured on this machine rather than guessed.  One verify is ~8 s of waiting
+# for the finger plus ~9 s of registering the strip against the map; one
+# enrolment is up to 12 swipe attempts, each of which also registers against
+# every swipe already accepted.  A timeout shorter than the work is
+# indistinguishable from a wedge, and would send the recovery ladder after a
+# device that is merely busy.
+SWIPE_VERIFY_TIMEOUT=60    # prompt + swipe + assemble + match against the map
+SWIPE_ENROLL_TIMEOUT=600   # up to 12 swipes, each registered against the rest
 
 DEBUG=0; ITERATIONS=10
 SWIPE_CALIBRATE=0; SWIPE_MAX_FRAMES=""; SWIPE_PARTIAL=1
 
 if [[ -t 1 ]]; then
-  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; DIM=$'\e[2m'; N=$'\e[0m'
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; DIM=$'\e[2m'; BOLD=$'\e[1m'; N=$'\e[0m'
 else
-  R=; G=; Y=; B=; DIM=; N=
+  R=; G=; Y=; B=; DIM=; BOLD=; N=
 fi
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s  ✔%s %s\n' "$G" "$N" "$*"; }
@@ -518,6 +529,168 @@ do_enroll() {
     hang)  bad "enrollment hung — device wedged"; return 1 ;;
     *)     bad "enrollment failed"; sed -n '1,20p' "$outfile"; return 1 ;;
   esac
+}
+
+swipe_prompt() {
+  say "  ${BOLD}SWIPE — do not press and hold.${N}"
+  say "  Put the pad of your finger at the TIP end of the sensor and draw it"
+  say "  steadily toward you, across the short axis of the strip, over about"
+  say "  one second. The sensor window is 2.6 mm in that direction, so the"
+  say "  motion is the length of your fingertip, not the width of the sensor."
+  say
+  note "The device stops sending after ~0.5 s whatever you do (a known"
+  note "firmware wedge), so each swipe is truncated on purpose and the driver"
+  note "mosaics several of them into one map. A short swipe is expected."
+}
+
+do_swipe_enroll() {
+  mkdir -p "$LOGDIR"
+  # Unwedge FIRST: on affected units the one good activation per power-up is a
+  # scarce resource, and spending it on a doomed attempt wastes the boot.
+  step "Preparing the device before enrolling"
+  unwedge 2
+  say
+
+  local outfile="$LOGDIR/swipe-enroll.log"
+  step "Enrolling by swiping"
+  swipe_prompt
+  say "  You will be asked to swipe several times. Shift the finger slightly"
+  say "  sideways between swipes: a swipe already covers the full LENGTH of the"
+  say "  fingertip, so only sideways movement adds new area to the map."
+  say
+  note "Swipes that cannot be registered against the others are rejected and"
+  note "re-prompted. About one in three is normal; the driver gives up after 12."
+  say
+
+  # Stream the driver's verdicts LIVE and annotate each one. Buffering these
+  # into a file and printing at the end means swiping blind: you cannot tell a
+  # rejected swipe from an accepted one until the whole enrolment is over, so
+  # you cannot correct your technique while it still matters.
+  say "  ${BOLD}SWIPE NOW${N} — then keep swiping as prompted."
+  say
+  local rc=0
+  timeout "$SWIPE_ENROLL_TIMEOUT" stdbuf -oL -eL fprintd-enroll "$FPUSER" 2>&1 \
+    | tee "$outfile" \
+    | { n=0; acc=0
+        while IFS= read -r line; do
+          case $line in
+            *enroll-stage-passed*)
+              n=$((n+1)); acc=$((acc+1))
+              printf '  %s✔%s swipe %d ACCEPTED  (%d on the map)  — swipe again\n' \
+                     "$G" "$N" "$n" "$acc" ;;
+            *enroll-swipe-too-short*)
+              n=$((n+1))
+              printf '  %s✘%s swipe %d too short — draw the finger further, ~1 s\n' \
+                     "$Y" "$N" "$n" ;;
+            *enroll-finger-not-centered*)
+              n=$((n+1))
+              printf '  %s✘%s swipe %d off-centre — start at the tip end of the strip\n' \
+                     "$Y" "$N" "$n" ;;
+            *enroll-retry-scan*|*enroll-remove-and-retry*)
+              n=$((n+1))
+              printf '  %s✘%s swipe %d not usable — lift fully, then swipe again\n' \
+                     "$Y" "$N" "$n" ;;
+            *enroll-duplicate*)
+              n=$((n+1))
+              printf '  %s!%s swipe %d duplicates one already on the map — shift sideways\n' \
+                     "$Y" "$N" "$n" ;;
+            *enroll-completed*)
+              printf '  %s✔%s enrolment COMPLETE — %d swipes on the map\n' "$G" "$N" "$acc" ;;
+            *enroll-disconnected*)
+              printf '  %s✘%s device dropped off the bus mid-enrolment\n' "$R" "$N" ;;
+            *enroll-unknown-error*)
+              printf '  %s✘%s driver error — see %s\n' "$R" "$N" "$outfile" ;;
+            *Enrolling*|*Using\ device*) : ;;
+            *) [[ -n $line ]] && printf '    %s%s%s\n' "$DIM" "$line" "$N" ;;
+          esac
+        done; }
+  rc=${PIPESTATUS[0]}
+  say
+
+  local result
+  if (( rc == 124 )); then result=hang
+  elif grep -q "enroll-completed" "$outfile" 2>/dev/null; then result=match
+  else result=error; fi
+
+  case $result in
+    match) ok "enrollment completed"
+           # The map geometry is the one number that says whether the enrolment
+           # is any good, and it only appears in the driver log.
+           grep -o 'enrolled .*' "$outfile" 2>/dev/null | tail -1 | while read -r l; do
+             note "$l"
+           done
+           say; note "now run: elan-fp swipe-test"; return 0 ;;
+    hang)  bad "enrollment hung — device wedged"
+           note "run: elan-fp unwedge, then try again"; return 1 ;;
+    *)     bad "enrollment failed"
+           sed -n '1,25p' "$outfile"
+           note "if every swipe was rejected, the swipes were of different parts"
+           note "of the finger — swipe the same way each time, shifting only a little"
+           return 1 ;;
+  esac
+}
+
+do_swipe_test() {
+  local pass=0 fail=0 hang=0 i result outfile
+  mkdir -p "$LOGDIR"
+
+  if [[ -z $(enrolled_fingers) ]]; then
+    bad "no enrolled prints — run: elan-fp swipe-enroll"
+    return 3
+  fi
+
+  say "Running $ITERATIONS verifications."
+  swipe_prompt
+  say "This is the only meaningful gate: enrollment succeeding proves nothing."
+  say
+  say "  ${BOLD}SWIPE at each prompt.${N}"
+  say
+  for ((i = 1; i <= ITERATIONS; i++)); do
+    outfile="$LOGDIR/swipe-test-$i.log"
+    printf '  %2d/%d ... ' "$i" "$ITERATIONS"
+    result=$(run_fprintd "$SWIPE_VERIFY_TIMEOUT" "$outfile" fprintd-verify "$FPUSER")
+    case $result in
+      match)    printf '%smatch%s\n'    "$G" "$N"; pass=$((pass + 1)) ;;
+      no-match) printf '%sno-match%s\n' "$Y" "$N"; fail=$((fail + 1)) ;;
+      hang)     printf '%shang%s\n'     "$R" "$N"; hang=$((hang + 1)) ;;
+      *)        printf '%serror%s\n'    "$R" "$N"; fail=$((fail + 1)) ;;
+    esac
+
+    # A wedge mid-run destroys the sample rather than the device. Recover and
+    # RETRY the same attempt, so a run always yields $ITERATIONS real verdicts.
+    if [[ $result == hang || $result == error ]]; then
+      printf '        recovering ... '
+      if usb_suspend_cycle >/dev/null 2>&1; then printf 'ok, retrying\n'
+      else kill_fprintd; printf 'partial, retrying\n'; fi
+      result=$(run_fprintd "$SWIPE_VERIFY_TIMEOUT" "$outfile" fprintd-verify "$FPUSER")
+      case $result in
+        match)    printf '  %2d/%d retry ... %smatch%s\n'    "$i" "$ITERATIONS" "$G" "$N"
+                  pass=$((pass + 1)); hang=$((hang > 0 ? hang - 1 : 0)) ;;
+        no-match) printf '  %2d/%d retry ... %sno-match%s\n' "$i" "$ITERATIONS" "$Y" "$N"
+                  fail=$((fail + 1)); hang=$((hang > 0 ? hang - 1 : 0)) ;;
+        *)        printf '  %2d/%d retry ... %sstill wedged%s\n' "$i" "$ITERATIONS" "$R" "$N" ;;
+      esac
+    fi
+    (( hang >= 4 )) && { say; warn "wedging repeatedly even after recovery — stopping"; break; }
+  done
+
+  say
+  say "  ${G}match${N} $pass   ${Y}no-match${N} $fail   ${R}hang${N} $hang   of $ITERATIONS"
+  say
+  if (( pass == ITERATIONS )); then
+    ok "$pass/$ITERATIONS genuine swipes accepted."
+    warn "This measures FALSE REJECTS only. Nothing here measures false ACCEPTS:"
+    warn "the driver has never been tested against a second finger or person,"
+    warn "so it has no false-accept rate and must not be wired to PAM."
+  elif (( pass > 0 )); then
+    warn "intermittent — every failed auth costs a delay and a re-swipe."
+    note "check the swipe direction is the same each time"
+  else
+    bad "no matches"
+    note "run: elan-fp swipe-enroll  (a press-era template cannot be matched"
+    note "by the swipe driver and is refused; the log will say so)"
+  fi
+  return 0
 }
 
 do_test() {
@@ -1034,6 +1207,7 @@ CMD=""; LABEL=""
 while (( $# )); do
   case $1 in
     status|verify|enroll|test|score|impostor|unwedge|swipe|doctor) CMD=$1 ;;
+    swipe-enroll|swipe-test) CMD=$1 ;;
     collect) CMD=collect; shift; LABEL="${1:-}" ;;
     swipe-report) CMD=swipe-report; shift; LABEL="${1:-}" ;;
     --debug) DEBUG=1 ;;
@@ -1067,6 +1241,8 @@ case $CMD in
   unwedge) need_root; unwedge 3 ;;
   collect) need_root; do_collect "$LABEL" ;;
   swipe)   do_swipe ;;
+  swipe-enroll) need_root; do_swipe_enroll ;;
+  swipe-test)   do_swipe_test ;;
   swipe-report)
            if [[ -z $LABEL || ! -d $LABEL ]]; then
              bad "usage: elan-fp swipe-report <capture dir>"
