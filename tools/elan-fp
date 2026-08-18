@@ -586,31 +586,6 @@ do_swipe_enroll() {
     warn "device address kept changing; enrolment may fail immediately"
   fi
 
-  # Bring the daemon up and confirm the device actually ANSWERS before
-  # prompting for a swipe. fprintd is D-Bus activated, so the first call after
-  # a USB re-enumeration is the one that opens the device -- if that fails, it
-  # fails before the user has touched anything, which reads as "crashed as soon
-  # as I entered my password".
-  step "Waiting for the device to answer"
-  local ready=0 t
-  for t in 1 2 3 4 5; do
-    if timeout 15 fprintd-list "$FPUSER" >/dev/null 2>&1 || \
-       timeout 15 fprintd-list "$FPUSER" 2>&1 | grep -q "NoEnrolledPrints"; then
-      ready=1; break
-    fi
-    note "attempt $t: device not answering yet, re-settling"
-    kill_fprintd
-    usb_suspend_cycle >/dev/null 2>&1
-    sleep 2
-  done
-  if (( ready )); then
-    ok "device is answering — ready to enrol"
-  else
-    bad "device will not answer after 5 attempts; it is wedged harder than usual"
-    note "try a full power cycle (shut down, wait 10 s, boot) and run this again"
-    return 1
-  fi
-  say
 
   local outfile="$LOGDIR/swipe-enroll.log"
   step "Enrolling by swiping"
@@ -627,6 +602,36 @@ do_swipe_enroll() {
   # into a file and printing at the end means swiping blind: you cannot tell a
   # rejected swipe from an accepted one until the whole enrolment is over, so
   # you cannot correct your technique while it still matters.
+  # Start the daemon BY HAND, once, and use THAT daemon for everything.
+  #
+  # Every claim/release cycle costs this device: a readiness probe against a
+  # D-Bus-activated daemon, followed by killing it to start our own, was enough
+  # to make the device vanish before the first swipe. One daemon, one open.
+  #
+  # Running it by hand also keeps the driver's explanation of a refusal out of
+  # the system journal and its dumps out of fprintd.service's PrivateTmp --
+  # both of which are invisible exactly when something has gone wrong.
+  local dumpdir="$LOGDIR/enroll-dump"
+  rm -rf "$dumpdir"; mkdir -p "$dumpdir"
+  DBG_LOG="$LOGDIR/driver-enroll-$(date +%Y%m%d-%H%M%S).log"
+  kill_fprintd
+  as_root sh -c "LC_ALL=C G_MESSAGES_DEBUG=all ELANPRESS_DUMP_DIR='$dumpdir' /usr/lib/fprintd -t > '$DBG_LOG' 2>&1 &"
+  sleep 2
+  trap 'stop_debug_daemon' EXIT
+
+  step "Checking the device answers (via this daemon, no extra open/close)"
+  if timeout 20 fprintd-list "$FPUSER" >/dev/null 2>&1 || \
+     timeout 20 fprintd-list "$FPUSER" 2>&1 | grep -q "NoEnrolledPrints"; then
+    ok "device is answering — ready to enrol"
+  else
+    bad "device will not answer"
+    note "it is wedged harder than a suspend/resume can clear"
+    note "power the machine off, wait 10 s, boot, and run this again"
+    stop_debug_daemon; trap - EXIT
+    return 1
+  fi
+  say
+
   say "  ${BOLD}SWIPE NOW${N} — then keep swiping as prompted."
   say
   local rc=0
@@ -685,6 +690,15 @@ do_swipe_enroll() {
            note "run: elan-fp unwedge, then try again"; return 1 ;;
     *)     bad "enrollment failed"
            sed -n '1,25p' "$outfile"
+           # the driver's own reason lives in the daemon log, not the client's
+           local why
+           why=$(grep -ahE "no usable map|salvaging|refus|reject" "$DBG_LOG" 2>/dev/null | tail -3)
+           if [[ -n $why ]]; then
+             say; warn "driver said:"
+             printf '%s\n' "$why" | sed 's/^/      /'
+           fi
+           note "driver log: $DBG_LOG"
+           note "dumps:      $dumpdir"
            note "if every swipe was rejected, the swipes were of different parts"
            note "of the finger — swipe the same way each time, shifting only a little"
            return 1 ;;
