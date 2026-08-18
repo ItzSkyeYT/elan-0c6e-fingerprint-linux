@@ -509,6 +509,11 @@ do_enroll() {
   # scarce resource, and spending it on a doomed attempt wastes the boot.
   step "Preparing the device before enrolling"
   unwedge 2
+  if wait_device_stable; then
+    ok "device settled at $(basename "$(find_device)"), no stale fprintd handle"
+  else
+    warn "device address kept changing; enrolment may fail immediately"
+  fi
   say
 
   local outfile="$LOGDIR/enroll.log"
@@ -543,12 +548,68 @@ swipe_prompt() {
   note "mosaics several of them into one map. A short swipe is expected."
 }
 
+
+# Wait until the device has been enumerated at a STABLE address, then make sure
+# no fprintd is holding a handle to whatever it was before.
+#
+# Re-enumeration (recovery level 3, and the kernel's own recovery) gives the
+# device a new address. A fprintd that opened the device across that boundary
+# keeps a handle to a node that no longer exists, and the very next operation
+# fails with "This device has been removed from the system" -- which looks like
+# a crash on the first swipe but happened before the user touched anything.
+wait_device_stable() {
+  local tries=0 a b
+  while (( tries < 10 )); do
+    a=$(find_device) || { sleep 1; tries=$((tries+1)); continue; }
+    sleep 1
+    b=$(find_device) || { sleep 1; tries=$((tries+1)); continue; }
+    if [[ $a == "$b" ]]; then
+      # settled at $a; drop any daemon that predates it
+      kill_fprintd
+      sleep 1
+      return 0
+    fi
+    tries=$((tries+1))
+  done
+  return 1
+}
+
 do_swipe_enroll() {
   mkdir -p "$LOGDIR"
   # Unwedge FIRST: on affected units the one good activation per power-up is a
   # scarce resource, and spending it on a doomed attempt wastes the boot.
   step "Preparing the device before enrolling"
   unwedge 2
+  if wait_device_stable; then
+    ok "device settled at $(basename "$(find_device)")"
+  else
+    warn "device address kept changing; enrolment may fail immediately"
+  fi
+
+  # Bring the daemon up and confirm the device actually ANSWERS before
+  # prompting for a swipe. fprintd is D-Bus activated, so the first call after
+  # a USB re-enumeration is the one that opens the device -- if that fails, it
+  # fails before the user has touched anything, which reads as "crashed as soon
+  # as I entered my password".
+  step "Waiting for the device to answer"
+  local ready=0 t
+  for t in 1 2 3 4 5; do
+    if timeout 15 fprintd-list "$FPUSER" >/dev/null 2>&1 || \
+       timeout 15 fprintd-list "$FPUSER" 2>&1 | grep -q "NoEnrolledPrints"; then
+      ready=1; break
+    fi
+    note "attempt $t: device not answering yet, re-settling"
+    kill_fprintd
+    usb_suspend_cycle >/dev/null 2>&1
+    sleep 2
+  done
+  if (( ready )); then
+    ok "device is answering — ready to enrol"
+  else
+    bad "device will not answer after 5 attempts; it is wedged harder than usual"
+    note "try a full power cycle (shut down, wait 10 s, boot) and run this again"
+    return 1
+  fi
   say
 
   local outfile="$LOGDIR/swipe-enroll.log"
