@@ -590,9 +590,16 @@ do_swipe_enroll() {
   local outfile="$LOGDIR/swipe-enroll.log"
   step "Enrolling by swiping"
   swipe_prompt
-  say "  You will be asked to swipe several times. Shift the finger slightly"
-  say "  sideways between swipes: a swipe already covers the full LENGTH of the"
-  say "  fingertip, so only sideways movement adds new area to the map."
+  say "  ${BOLD}Swipe the SAME way every time.${N} Same start point, same speed,"
+  say "  same direction. Each swipe has to REGISTER against the previous ones,"
+  say "  and it can only do that where they overlap."
+  say
+  say "  Do NOT deliberately shift sideways. That was earlier advice aimed at"
+  say "  covering more of the fingertip, and it is wrong here: a swipe of a"
+  say "  different patch of skin scores NCC ~0.15 against the map, is rejected,"
+  say "  and costs you one of the ~3 captures the device survives per session."
+  say "  The small natural variation between your own swipes already supplies"
+  say "  all the extra coverage the map needs."
   say
   note "Swipes that cannot be registered against the others are rejected and"
   note "re-prompted. About one in three is normal; the driver gives up after 12."
